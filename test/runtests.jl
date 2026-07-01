@@ -8,4 +8,5 @@ using XRootD
     include("wire/test_primitives.jl")
     include("wire/test_constants.jl")
     include("wire/test_frames.jl")
+    include("wire/test_requests.jl")
 end
