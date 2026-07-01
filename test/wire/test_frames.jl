@@ -32,32 +32,13 @@ Wire.payload(::FakePayloadRequest) = codeunits("/tmp")
     @testset "request framing" begin
         frame = encode(FakeRequest(), UInt16(0x0003))
         @test length(frame) == REQUEST_HDRLEN
+        #! format: off
         @test frame == UInt8[
-            0x00,
-            0x03,
-            0x0b,
-            0xc3,                           # streamid, kXR_ping
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,  # body
-            0x00,
-            0x00,
-            0x00,
-            0x00,                           # dlen = 0
+            0x00, 0x03, 0x0b, 0xc3,                           # streamid, kXR_ping
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # body
+            0x00, 0x00, 0x00, 0x00,                           # dlen = 0
         ]
+        #! format: on
 
         frame = encode(FakePayloadRequest(), UInt16(0x0005))
         @test length(frame) == REQUEST_HDRLEN + 4
