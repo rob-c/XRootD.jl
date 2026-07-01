@@ -5,4 +5,5 @@ using XRootD
     @testset "package smoke" begin
         @test isdefined(XRootD, :Wire)
     end
+    include("wire/test_primitives.jl")
 end

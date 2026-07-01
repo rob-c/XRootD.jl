@@ -13,4 +13,6 @@ wire.
 """
 module Wire
 
+include("primitives.jl")
+
 end # module Wire
