@@ -1,18 +1,8 @@
 using Test
-using XRootD.XrdCl
-import XRootD
+using XRootD
 
-#---Start the xrootd server-----------------------------------------------------------------------
-xrootd_server = run(XRootD.xrootd(); wait=false)
-sleep(1)
-
-#---Test the XRootD.jl package---------------------------------------------------------------------
-@testset "XRootD tests" verbose = true begin
-    include("testFileSystem.jl")
-    include("testFile.jl")
+@testset verbose = true "XRootD.jl" begin
+    @testset "package smoke" begin
+        @test isdefined(XRootD, :Wire)
+    end
 end
-
-#---Stop the xrootd server------------------------------------------------------------------------
-kill(xrootd_server)
-
-

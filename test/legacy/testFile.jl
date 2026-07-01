@@ -7,15 +7,14 @@ mutable struct Data
     c::Int32
     d::Bool
 end
-Data() = Data(0,0,0,false)
+Data() = Data(0, 0, 0, false)
 Base.:(==)(x::Data, y::Data) = x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d
 
 @testset "File tests" begin
-
     open("/tmp/testfile", "w") do f
         write(f, "Hello, world!")
     end
-    
+
     f = File("root://localhost:1094//tmp/nonexisting")
     @test isnothing(f)
 
@@ -26,7 +25,9 @@ Base.:(==)(x::Data, y::Data) = x.a == y.a && x.b == y.b && x.c == y.c && x.d == 
     @test statinfo.size == 13
 
     f = File()
-    st, response = open(f, "root://localhost:1094//tmp/new_testfile", OpenFlags.Write|OpenFlags.Delete)
+    st, response = open(
+        f, "root://localhost:1094//tmp/new_testfile", OpenFlags.Write|OpenFlags.Delete
+    )
     @test isOK(st)
     @test isopen(f)
     st, response = truncate(f, 0)
@@ -131,5 +132,4 @@ Base.:(==)(x::Data, y::Data) = x.a == y.a && x.b == y.b && x.c == y.c && x.d == 
 
     close(f)
     rm("/tmp/testfile4")
-
 end

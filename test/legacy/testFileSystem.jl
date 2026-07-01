@@ -43,9 +43,8 @@ using XRootD.XrdCl
     @test statinfo2.flags == statinfo.flags
     @test statinfo2.octmode[1:3] == statinfo.octmode[1:3]  # owner permissions the same
 
-
     # Locate
-    st , locations = locate(fs, "/tmp", OpenFlags.Refresh)
+    st, locations = locate(fs, "/tmp", OpenFlags.Refresh)
     @test isOK(st)
     @test length(locations) > 0
 
@@ -61,7 +60,7 @@ using XRootD.XrdCl
     @test isOK(st)
     @test isfile("/tmp/testfile2")
     @test !isfile("/tmp/testfile")
-    
+
     # DirectoryList
     st, entries = readdir(fs, "/tmp")
     @test isOK(st)
@@ -169,6 +168,4 @@ using XRootD.XrdCl
     st, protocolinfo = protocol(fs)
     @test isOK(st)
     show(devnull, protocolinfo) # test the show method
-
 end
-

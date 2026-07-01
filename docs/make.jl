@@ -4,8 +4,8 @@ using XRootD.XrdCl
 
 makedocs(;
     modules=[XRootD, XRootD.XrdCl],
-    format = Documenter.HTML(
-        prettyurls = Base.get(ENV, "CI", nothing) == "true",
+    format=Documenter.HTML(;
+        prettyurls=Base.get(ENV, "CI", nothing) == "true",
         repolink="https://github.com/JuliaHEP/XRootD.jl",
     ),
     pages=[
@@ -19,7 +19,4 @@ makedocs(;
     authors="Pere Mato",
 )
 
-deploydocs(;
-    repo="github.com/JuliaHEP/XRootD.jl",
-    push_preview = true
-)
+deploydocs(; repo="github.com/JuliaHEP/XRootD.jl", push_preview=true)
