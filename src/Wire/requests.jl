@@ -96,3 +96,63 @@ payload(r::AuthRequest) = r.cred
 struct PingRequest <: Request end
 
 requestid(::PingRequest) = kXR_ping
+
+"""
+    StatRequest(path::AbstractString;
+                options::UInt8 = 0x00,
+                fhandle::NTuple{4,UInt8} = (0x00, 0x00, 0x00, 0x00))
+
+`kXR_stat` — stat a path (the usual case) or an open file handle (empty
+`path` + real `fhandle`). `options = kXR_vfs` requests virtual-filesystem
+(statvfs) information instead. The response body is the ASCII stat line
+`"<id> <size> <flags> <mtime>"` (see [`parse_stat_line`](@ref)).
+"""
+struct StatRequest <: Request
+    path::String
+    options::UInt8
+    fhandle::NTuple{4,UInt8}
+end
+
+function StatRequest(
+    path::AbstractString;
+    options::UInt8=0x00,
+    fhandle::NTuple{4,UInt8}=(0x00, 0x00, 0x00, 0x00),
+)
+    return StatRequest(String(path), options, fhandle)
+end
+
+requestid(::StatRequest) = kXR_stat
+
+function body!(frame::Vector{UInt8}, r::StatRequest)
+    frame[5] = r.options                       # bytes 6:16 reserved (zero)
+    set_bytes!(frame, 17, collect(r.fhandle))
+    return frame
+end
+
+payload(r::StatRequest) = codeunits(r.path)
+
+"""
+    DirlistRequest(path::AbstractString; options::UInt8 = kXR_dstat)
+
+`kXR_dirlist` — list a directory. The default `kXR_dstat` asks for per-entry
+stat lines (the server then prepends the `".\\n0 0 0 0\\n"` sentinel — see
+[`parse_dirlist`](@ref)). Large listings arrive chunked via `kXR_oksofar`;
+accumulating chunks is the Session layer's job.
+"""
+struct DirlistRequest <: Request
+    path::String
+    options::UInt8
+end
+
+function DirlistRequest(path::AbstractString; options::UInt8=kXR_dstat)
+    return DirlistRequest(String(path), options)
+end
+
+requestid(::DirlistRequest) = kXR_dirlist
+
+function body!(frame::Vector{UInt8}, r::DirlistRequest)
+    frame[20] = r.options   # body bytes 1:15 reserved; options is byte 16
+    return frame
+end
+
+payload(r::DirlistRequest) = codeunits(r.path)

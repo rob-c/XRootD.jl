@@ -1043,7 +1043,7 @@ using XRootD.Wire: StatRequest, DirlistRequest, kXR_dstat, kXR_vfs
     @testset "kXR_stat golden frame" begin
         frame = encode(StatRequest("/tmp"), UInt16(5))
         @test frame == vcat(
-            UInt8[0x00, 0x05, 0x0b, 0xd9],       # streamid, kXR_stat (3017)
+            UInt8[0x00, 0x05, 0x0b, 0xc9],       # streamid, kXR_stat (3017)
             zeros(UInt8, 16),                    # options=0, reserved, fhandle=0
             UInt8[0x00, 0x00, 0x00, 0x04],       # dlen = 4
             Vector{UInt8}(codeunits("/tmp")),    # path, no trailing NUL
@@ -1060,7 +1060,7 @@ using XRootD.Wire: StatRequest, DirlistRequest, kXR_dstat, kXR_vfs
     @testset "kXR_dirlist golden frame" begin
         frame = encode(DirlistRequest("/data"), UInt16(6))
         @test frame == vcat(
-            UInt8[0x00, 0x06, 0x0b, 0xc4],       # streamid, kXR_dirlist (3004)
+            UInt8[0x00, 0x06, 0x0b, 0xbc],       # streamid, kXR_dirlist (3004)
             zeros(UInt8, 15),                    # reserved[15]
             UInt8[kXR_dstat],                    # options at body byte 16
             UInt8[0x00, 0x00, 0x00, 0x05],       # dlen = 5

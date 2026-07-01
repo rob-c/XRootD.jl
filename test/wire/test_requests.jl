@@ -49,3 +49,35 @@ using XRootD.Wire: ProtocolRequest, LoginRequest, AuthRequest, PingRequest, enco
         @test frame == vcat(UInt8[0x00, 0x03, 0x0b, 0xc3], zeros(UInt8, 20))
     end
 end
+
+using XRootD.Wire: StatRequest, DirlistRequest, kXR_dstat, kXR_vfs
+
+@testset "Wire fs requests" begin
+    @testset "kXR_stat golden frame" begin
+        frame = encode(StatRequest("/tmp"), UInt16(5))
+        @test frame == vcat(
+            UInt8[0x00, 0x05, 0x0b, 0xc9],       # streamid, kXR_stat (3017)
+            zeros(UInt8, 16),                    # options=0, reserved, fhandle=0
+            UInt8[0x00, 0x00, 0x00, 0x04],       # dlen = 4
+            Vector{UInt8}(codeunits("/tmp")),    # path, no trailing NUL
+        )
+        vfs = encode(StatRequest("/data"; options=kXR_vfs), UInt16(5))
+        @test vfs[5] == 0x01
+        byhandle = encode(StatRequest(""; fhandle=(0x01, 0x02, 0x03, 0x04)), UInt16(5))
+        @test byhandle[17:20] == UInt8[0x01, 0x02, 0x03, 0x04]
+        @test byhandle[21:24] == zeros(UInt8, 4)   # dlen = 0 when path empty
+    end
+
+    @testset "kXR_dirlist golden frame" begin
+        frame = encode(DirlistRequest("/data"), UInt16(6))
+        @test frame == vcat(
+            UInt8[0x00, 0x06, 0x0b, 0xbc],       # streamid, kXR_dirlist (3004)
+            zeros(UInt8, 15),                    # reserved[15]
+            UInt8[kXR_dstat],                    # options at body byte 16
+            UInt8[0x00, 0x00, 0x00, 0x05],       # dlen = 5
+            Vector{UInt8}(codeunits("/data")),
+        )
+        plain = encode(DirlistRequest("/data"; options=0x00), UInt16(6))
+        @test plain[20] == 0x00
+    end
+end
