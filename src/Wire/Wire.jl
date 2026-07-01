@@ -17,5 +17,6 @@ include("primitives.jl")
 include("constants.jl")
 include("frames.jl")
 include("requests.jl")
+include("responses.jl")
 
 end # module Wire
