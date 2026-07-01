@@ -1,7 +1,20 @@
 # XRootD.jl 0.3: Pure-Julia client — design
 
 Date: 2026-07-01
-Status: approved
+Status: approved (2026-07-02, with the attribution, dual-parity testing, and
+code-quality requirements below)
+
+## Attribution
+
+The protocol understanding, architecture, and operational semantics implemented
+here were developed in the `libxrdc` pure-C client
+(`/home/rcurrie/HEP-x/nginx-xrootd/client/`). That work — the wire-protocol
+ground truth, the async/resilience design, the auth flows, and the CLI
+behavior — is the reference this implementation translates into Julia. The
+CLI tools' `--version`/help output and the package documentation credit
+`libxrdc` as the prior art, and module docstrings for translated designs
+(Session mux, copy pump, resilience policy) cite the corresponding `libxrdc`
+sources.
 
 ## Goal
 
@@ -140,13 +153,39 @@ codes (mirroring `xrdc_shellcode`).
 
 ### Testing
 
+Parity must be demonstrated against **both** reference implementations: the
+official XRootD distribution (server + `xrdcp`/`xrdfs` clients) and the
+`libxrdc` C client.
+
 1. **Wire unit tests** — byte-exact golden frames for every request/response
-   codec, fixtures captured from libxrdc/official-client traffic.
+   codec, fixtures captured from libxrdc and official-client traffic.
 2. **Integration** — against a real server: official `xrootd` container in
    CI; the nginx-xrootd gateway locally. Existing test files run unmodified
    as the compatibility gate.
-3. **Cross-checks** — Julia `xrdcp`/checksum tools vs the C binaries on
-   identical inputs (same bytes moved, same digests, same exit codes).
+3. **Cross-implementation parity suite** — a dedicated test tier that runs
+   the same scripted scenarios through three clients — XRootD.jl, `libxrdc`
+   binaries (`client/bin/`), and the official `xrdcp`/`xrdfs` — against the
+   same servers, asserting identical observable behavior: bytes moved,
+   digests, directory listings, stat fields, xattr round-trips, and exit
+   codes. Interoperability is also crossed: files written by one client are
+   read back and verified by the others.
+
+### Code quality
+
+The code must read as expert, modern Julia — indistinguishable from senior
+Julia-ecosystem output (per the project rules in CLAUDE.md):
+
+- Formatting enforced by JuliaFormatter with a committed `.JuliaFormatter.toml`
+  (BlueStyle base); CI fails on unformatted code.
+- Every public symbol has a docstring with signature, arguments, returns, and
+  a runnable example; module-level docstrings explain layer responsibilities
+  and cite the corresponding `libxrdc` sources for translated designs.
+- Idiomatic patterns throughout: multiple dispatch over flags/branching,
+  concrete-field structs, `do`-block resource management for open/close,
+  zero-allocation hot paths in Wire/Session verified with allocation tests,
+  no `Any`-typed containers in the data path.
+- Quality gates in CI: Aqua.jl (project hygiene), JET.jl (type stability of
+  the public API), Documenter.jl doctests.
 
 ### Dependencies
 
