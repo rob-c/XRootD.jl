@@ -6,4 +6,5 @@ using XRootD
         @test isdefined(XRootD, :Wire)
     end
     include("wire/test_primitives.jl")
+    include("wire/test_constants.jl")
 end

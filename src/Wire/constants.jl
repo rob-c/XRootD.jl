@@ -1,0 +1,138 @@
+# XRootD protocol constants. Names are kept verbatim from the protocol
+# vocabulary (nginx-xrootd src/protocol/opcodes.h + flags.h) so every value
+# is greppable against the C reference; this deliberately departs from Julia
+# naming style.
+
+#! format: off
+
+# ---- request opcodes (ClientRequestHdr.requestid) ----
+const kXR_auth      = UInt16(3000)
+const kXR_query     = UInt16(3001)
+const kXR_chmod     = UInt16(3002)
+const kXR_close     = UInt16(3003)
+const kXR_dirlist   = UInt16(3004)
+const kXR_gpfile    = UInt16(3005)
+const kXR_protocol  = UInt16(3006)
+const kXR_login     = UInt16(3007)
+const kXR_mkdir     = UInt16(3008)
+const kXR_mv        = UInt16(3009)
+const kXR_open      = UInt16(3010)
+const kXR_ping      = UInt16(3011)
+const kXR_chkpoint  = UInt16(3012)
+const kXR_read      = UInt16(3013)
+const kXR_rm        = UInt16(3014)
+const kXR_rmdir     = UInt16(3015)
+const kXR_sync      = UInt16(3016)
+const kXR_stat      = UInt16(3017)
+const kXR_set       = UInt16(3018)
+const kXR_write     = UInt16(3019)
+const kXR_fattr     = UInt16(3020)
+const kXR_prepare   = UInt16(3021)
+const kXR_statx     = UInt16(3022)
+const kXR_endsess   = UInt16(3023)
+const kXR_bind      = UInt16(3024)
+const kXR_readv     = UInt16(3025)
+const kXR_pgwrite   = UInt16(3026)
+const kXR_locate    = UInt16(3027)
+const kXR_truncate  = UInt16(3028)
+const kXR_sigver    = UInt16(3029)
+const kXR_pgread    = UInt16(3030)
+const kXR_writev    = UInt16(3031)
+const kXR_clone     = UInt16(3032)
+
+# ---- nginx-xrootd vendor extensions (capability-negotiated via
+# kXR_Qconfig "xrdfs.ext"; never sent to stock servers) ----
+const kXR_setattr   = UInt16(3500)
+const kXR_symlink   = UInt16(3501)
+const kXR_readlink  = UInt16(3502)
+const kXR_link      = UInt16(3503)
+
+# ---- response status (ServerResponseHdr.status) ----
+const kXR_ok        = UInt16(0)
+const kXR_oksofar   = UInt16(4000)
+const kXR_attn      = UInt16(4001)
+const kXR_authmore  = UInt16(4002)
+const kXR_error     = UInt16(4003)
+const kXR_redirect  = UInt16(4004)
+const kXR_wait      = UInt16(4005)
+const kXR_waitresp  = UInt16(4006)
+const kXR_status    = UInt16(4007)
+
+# ---- kXR_attn action codes (still-active subset) ----
+const kXR_asyncms   = UInt32(5002)
+const kXR_asynresp  = UInt32(5008)
+
+# ---- handshake / kXR_protocol ----
+const ROOTD_PQ             = UInt32(2012)        # 5th word of the client hello
+const kXR_PROTOCOLVERSION  = UInt32(0x00000520)  # protocol 5.2.0
+const kXR_secreqs  = 0x01  # request the server's security-protocol trailer
+const kXR_ableTLS  = 0x02  # client can upgrade to in-protocol TLS
+const kXR_wantTLS  = 0x04  # client requires TLS - abort if unavailable
+const kXR_ExpLogin = 0x03  # "a kXR_login follows"
+
+# ---- kXR_login capver ----
+const kXR_asyncap = 0x80   # client handles asynchronous responses
+const kXR_ver005  = 0x05   # XRootD v5 client (TLS + sigver capable)
+
+const SESSION_ID_LEN = 16  # opaque sessid bytes in the login response
+
+# ---- kXR_dirlist options ----
+const kXR_online = 0x01
+const kXR_dstat  = 0x02
+const kXR_dcksm  = 0x04
+
+# ---- kXR_stat options ----
+const kXR_vfs = 0x01
+
+#! format: on
+
+const _REQUEST_NAMES = Dict{UInt16,String}(
+    kXR_auth => "kXR_auth",
+    kXR_query => "kXR_query",
+    kXR_chmod => "kXR_chmod",
+    kXR_close => "kXR_close",
+    kXR_dirlist => "kXR_dirlist",
+    kXR_gpfile => "kXR_gpfile",
+    kXR_protocol => "kXR_protocol",
+    kXR_login => "kXR_login",
+    kXR_mkdir => "kXR_mkdir",
+    kXR_mv => "kXR_mv",
+    kXR_open => "kXR_open",
+    kXR_ping => "kXR_ping",
+    kXR_chkpoint => "kXR_chkpoint",
+    kXR_read => "kXR_read",
+    kXR_rm => "kXR_rm",
+    kXR_rmdir => "kXR_rmdir",
+    kXR_sync => "kXR_sync",
+    kXR_stat => "kXR_stat",
+    kXR_set => "kXR_set",
+    kXR_write => "kXR_write",
+    kXR_fattr => "kXR_fattr",
+    kXR_prepare => "kXR_prepare",
+    kXR_statx => "kXR_statx",
+    kXR_endsess => "kXR_endsess",
+    kXR_bind => "kXR_bind",
+    kXR_readv => "kXR_readv",
+    kXR_pgwrite => "kXR_pgwrite",
+    kXR_locate => "kXR_locate",
+    kXR_truncate => "kXR_truncate",
+    kXR_sigver => "kXR_sigver",
+    kXR_pgread => "kXR_pgread",
+    kXR_writev => "kXR_writev",
+    kXR_clone => "kXR_clone",
+    kXR_setattr => "kXR_setattr",
+    kXR_symlink => "kXR_symlink",
+    kXR_readlink => "kXR_readlink",
+    kXR_link => "kXR_link",
+)
+
+"""
+    request_name(id::Integer) -> String
+
+The protocol name of a request opcode (`3017` → `"kXR_stat"`), for traces and
+error messages. Unknown ids render as `"kXR_unknown(id)"`. Mirrors libxrdc's
+`xrdc_reqid_name`.
+"""
+function request_name(id::Integer)
+    return get(_REQUEST_NAMES, UInt16(id), "kXR_unknown($(Int(id)))")
+end

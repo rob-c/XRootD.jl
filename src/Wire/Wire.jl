@@ -14,5 +14,6 @@ wire.
 module Wire
 
 include("primitives.jl")
+include("constants.jl")
 
 end # module Wire
