@@ -17,6 +17,7 @@ using ..Session
 
 export XRootDStatus, isOK, isError
 export FileSystem, ping, locate, query, rmdir, protocol
+export File, sync, readv, writev, pgread, pgwrite
 export isExecutable, isOffline
 export OpenFlags, Access, DirListFlags, QueryCode, MkDirFlags
 
@@ -24,5 +25,6 @@ include("status.jl")
 include("enums.jl")
 include("responses.jl")
 include("filesystem.jl")
+include("file.jl")
 
 end # module XrdCl
