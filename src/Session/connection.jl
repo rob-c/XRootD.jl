@@ -27,6 +27,8 @@ mutable struct Connection
     sec_level::Int                          # server security level (0 = no signing)
     signing_key::Union{Vector{UInt8},Nothing}
     sig_seqno::UInt64
+    last_activity::Float64                   # time() of the last frame sent
+    keepalive::Union{Timer,Nothing}
 end
 
 """
@@ -52,6 +54,7 @@ function connect(
     insecure_tls::Bool=false,
     token::Union{AbstractString,Nothing}=nothing,
     keytab::Union{AbstractString,Nothing}=nothing,
+    keepalive_s::Real=0,
 )
     sock::IO = Sockets.connect(String(host), port)
 
@@ -106,9 +109,32 @@ function connect(
         0,           # sec_level: no signing until negotiated
         nothing,     # signing_key
         UInt64(0),   # sig_seqno
+        time(),      # last_activity
+        nothing,     # keepalive timer
     )
     conn.reader = errormonitor(Threads.@spawn reader_loop(conn))
+    keepalive_s > 0 && start_keepalive!(conn, Float64(keepalive_s))
     return conn
+end
+
+"""
+Arm an idle keepalive: every `interval` seconds, if the connection has been
+idle at least that long, send a `kXR_ping` so a long-lived handle survives
+the server's idle timeout. The timer is cancelled on [`close`](@ref).
+"""
+function start_keepalive!(conn::Connection, interval::Float64)
+    conn.keepalive = Timer(interval; interval=interval) do _
+        (conn.closed || !isopen(conn.sock)) && return nothing
+        if time() - conn.last_activity >= interval
+            try
+                roundtrip(conn, Wire.PingRequest())
+            catch
+                # a failed ping just means the reader task will tear down
+            end
+        end
+        return nothing
+    end
+    return nothing
 end
 
 """
@@ -254,6 +280,7 @@ function send(conn::Connection, frame::Vector{UInt8})
     lock(conn.wlock) do
         return write(conn.sock, frame)
     end
+    conn.last_activity = time()
     return nothing
 end
 
@@ -313,6 +340,9 @@ end
 
 function Base.close(conn::Connection)
     conn.closed = true
+    ka = conn.keepalive
+    ka === nothing || close(ka)
+    conn.keepalive = nothing
     isopen(conn.sock) && close(conn.sock)
     return nothing
 end

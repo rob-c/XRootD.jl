@@ -43,14 +43,92 @@ function connection!(fs::FileSystem)
     return conn
 end
 
-"Run one request, converting connection failures into error statuses."
-function perform(fs::FileSystem, req::Wire.Request)
-    hdr, body = try
-        Session.roundtrip(connection!(fs), req)
-    catch err
-        return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), UInt8[]
+# Opcodes safe to replay after a transport failure without risk of a
+# double-effect (reads and metadata queries). Mutations are replayed only
+# when the request provably never reached the server (a connect failure
+# before any bytes were sent).
+const _IDEMPOTENT = Set{UInt16}([
+    Wire.kXR_ping,
+    Wire.kXR_stat,
+    Wire.kXR_dirlist,
+    Wire.kXR_locate,
+    Wire.kXR_query,
+    Wire.kXR_protocol,
+    Wire.kXR_readlink,
+    Wire.kXR_fattr,     # get/list are idempotent; set/del are too (last-writer-wins)
+])
+
+"Default reconnect+retry patience window (matches libxrdc XRDC_DEFAULT_MAX_STALL_MS)."
+const DEFAULT_MAX_STALL_MS = 30_000
+
+function max_stall_ms()
+    v = get(ENV, "XRDC_MAX_STALL_MS", "")
+    isempty(v) && return DEFAULT_MAX_STALL_MS
+    n = tryparse(Int, v)
+    return n === nothing ? DEFAULT_MAX_STALL_MS : n
+end
+
+"""
+Run one request with redirect following and bounded reconnect-and-replay.
+`kXR_redirect` steers the (fresh) connection to the target host; a transport
+sever reconnects to the home endpoint and replays idempotent operations
+within the stall window. Returns `(XRootDStatus, body)`.
+"""
+function perform(fs::FileSystem, req::Wire.Request; max_hops::Int=8)
+    idempotent = Wire.requestid(req) in _IDEMPOTENT
+    deadline = time() + max_stall_ms() / 1000
+    hops = 0
+    while true
+        conn = try
+            connection!(fs)
+        catch err
+            # Never connected: safe to retry any op while the window is open.
+            (time() < deadline) && (sleep(0.2); continue)
+            return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), UInt8[]
+        end
+
+        hdr, body = try
+            Session.roundtrip(conn, req)
+        catch err
+            fs.conn = nothing
+            if idempotent && time() < deadline
+                sleep(0.2)
+                continue
+            end
+            return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), UInt8[]
+        end
+
+        if hdr.status == Wire.kXR_redirect
+            hops += 1
+            hops > max_hops &&
+                return XRootDStatus(hdr.status, 0, 0, "too many redirects"), body
+            r = Wire.decode_redirect(body)
+            close(conn)
+            fs.host = r.host
+            fs.port = r.port > 0 ? Int(r.port) : fs.port
+            fs.conn = nothing
+            continue
+        end
+
+        # A synthetic transport-loss status (our roundtrip signals it on the
+        # closed connection): reconnect and replay when idempotent.
+        if hdr.status == Wire.kXR_error &&
+            is_transport_loss(body) &&
+            idempotent &&
+            time() < deadline
+            fs.conn = nothing
+            sleep(0.2)
+            continue
+        end
+
+        return status_from(hdr, body), body
     end
-    return status_from(hdr, body), body
+end
+
+"Recognize the reader task's synthetic connection-lost error body."
+function is_transport_loss(body::AbstractVector{UInt8})
+    length(body) < 4 && return false
+    return occursin("lost", Wire.decode_error(body).message)
 end
 
 """

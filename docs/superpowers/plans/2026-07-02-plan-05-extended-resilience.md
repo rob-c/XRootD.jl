@@ -53,14 +53,14 @@ Plans 01–04 constraints, plus (ground truth: libxrdc `fattr.c`, `ops_fs.c`,
 ## Tasks
 
 ### Task 1: Wire codecs — fattr, setattr, symlink/readlink/link, prepare
-- [ ] Golden tests + implementations for `FattrGetRequest`/`FattrSetRequest`/
+- [x] Golden tests + implementations for `FattrGetRequest`/`FattrSetRequest`/
   `FattrDelRequest`/`FattrListRequest`, `SetattrRequest`, `SymlinkRequest`,
   `ReadlinkRequest`, `LinkRequest`, `PrepareRequest`; decoders
   `parse_fattr_getset`, `parse_fattr_list`, `parse_statvfs`. Commit
   `feat(wire): extended operation codecs`.
 
 ### Task 2: Client extended API
-- [ ] `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statvfs`,
+- [x] `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statvfs`,
   `symlink`/`hardlink`/`readlink`, `prepare`, `checksum` on `FileSystem`;
   `getxattr`/`setxattr`/`listxattr`/`removexattr` on `File` (fhandle form).
   Mock + integration tests (xattr and checksum against XRootD_jll; vendor
@@ -69,7 +69,7 @@ Plans 01–04 constraints, plus (ground truth: libxrdc `fattr.c`, `ops_fs.c`,
   links, checksum`.
 
 ### Task 3: Resilience — redirect following + reconnect/replay
-- [ ] `roundtrip` grows an idempotency-aware retry wrapper: kXR_redirect →
+- [x] `roundtrip` grows an idempotency-aware retry wrapper: kXR_redirect →
   reconnect to the target and re-issue; transport sever → reconnect to home
   and replay (idempotent ops, or mutations proven un-sent) within the stall
   window. `FileSystem`/`File` mark each op's idempotency class. Mock tests:
@@ -78,7 +78,7 @@ Plans 01–04 constraints, plus (ground truth: libxrdc `fattr.c`, `ops_fs.c`,
   `feat(session): redirect following and reconnect-with-replay`.
 
 ### Task 4: Keepalive
-- [ ] An idle-timer Task per connection sends kXR_ping after an idle window
+- [x] An idle-timer Task per connection sends kXR_ping after an idle window
   so long-lived handles survive server idle timeouts. Off by default in
   tests (configurable window). Commit `feat(session): idle keepalive`.
 
