@@ -433,3 +433,134 @@ function body!(frame::Vector{UInt8}, r::SyncRequest)
     set_bytes!(frame, 5, collect(r.fhandle))
     return frame
 end
+
+# ---- vector I/O (readahead_list / write_list; libxrdc ops_file_rw.c) ----
+
+"One readv segment request: where to read and how much."
+const ReadVSegment = @NamedTuple{fhandle::NTuple{4,UInt8}, offset::Int64, rlen::Int32}
+
+"One writev segment: where to write and the bytes."
+const WriteVSegment = @NamedTuple{
+    fhandle::NTuple{4,UInt8}, offset::Int64, data::Vector{UInt8}
+}
+
+"""
+    ReadVRequest(segments::Vector{ReadVSegment})
+
+`kXR_readv` — scatter-gather read. The payload is one 16-byte
+`readahead_list` entry per segment (`fhandle[4] + rlen[4] + offset[8]`, all
+big-endian). The response interleaves a 16-byte echo header (carrying the
+ACTUAL length) and the data per segment — see [`parse_readv`](@ref).
+"""
+struct ReadVRequest <: Request
+    segments::Vector{ReadVSegment}
+end
+
+requestid(::ReadVRequest) = kXR_readv
+
+function payload(r::ReadVRequest)
+    pl = zeros(UInt8, 16 * length(r.segments))
+    for (i, seg) in enumerate(r.segments)
+        off = 16 * (i - 1) + 1
+        set_bytes!(pl, off, collect(seg.fhandle))
+        set_u32!(pl, off + 4, reinterpret(UInt32, seg.rlen))
+        set_u64!(pl, off + 8, reinterpret(UInt64, seg.offset))
+    end
+    return pl
+end
+
+"""
+    WriteVRequest(segments::Vector{WriteVSegment}; do_sync::Bool=false)
+
+`kXR_writev` — scatter-gather write, all-or-nothing. The payload is the
+16-byte `write_list` descriptor block back-to-back, FOLLOWED by the
+concatenated data for every segment (the server recovers the count from
+`n*16 + sum(wlen) == dlen`; libxrdc `xrdc_file_writev`). `do_sync` sets
+`kXR_wv_doSync` (fsync each touched handle).
+"""
+struct WriteVRequest <: Request
+    segments::Vector{WriteVSegment}
+    do_sync::Bool
+end
+
+function WriteVRequest(segments::Vector{WriteVSegment}; do_sync::Bool=false)
+    return WriteVRequest(segments, do_sync)
+end
+
+requestid(::WriteVRequest) = kXR_writev
+
+function body!(frame::Vector{UInt8}, r::WriteVRequest)
+    frame[5] = r.do_sync ? kXR_wv_doSync : 0x00
+    return frame
+end
+
+function payload(r::WriteVRequest)
+    ndesc = 16 * length(r.segments)
+    pl = zeros(UInt8, ndesc + sum(seg -> length(seg.data), r.segments))
+    cursor = ndesc + 1
+    for (i, seg) in enumerate(r.segments)
+        off = 16 * (i - 1) + 1
+        set_bytes!(pl, off, collect(seg.fhandle))
+        set_u32!(pl, off + 4, UInt32(length(seg.data)))
+        set_u64!(pl, off + 8, reinterpret(UInt64, seg.offset))
+        set_bytes!(pl, cursor, seg.data)
+        cursor += length(seg.data)
+    end
+    return pl
+end
+
+# ---- paged I/O (per-page CRC32c; libxrdc ops_file_pg.c) ----
+
+"""
+    PgReadRequest(fhandle, offset::Int64, rlen::Int32)
+
+`kXR_pgread` — paged read with per-page CRC32c integrity. The response uses
+`kXR_status` framing (see [`decode_status_body`](@ref) /
+[`decode_pages`](@ref)), not the plain `kXR_ok` path.
+"""
+struct PgReadRequest <: Request
+    fhandle::NTuple{4,UInt8}
+    offset::Int64
+    rlen::Int32
+end
+
+requestid(::PgReadRequest) = kXR_pgread
+
+function body!(frame::Vector{UInt8}, r::PgReadRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.offset))
+    set_u32!(frame, 17, reinterpret(UInt32, r.rlen))
+    return frame
+end
+
+"""
+    PgWriteRequest(fhandle, offset::Int64, data::Vector{UInt8}; reqflags::UInt8=0x00)
+
+`kXR_pgwrite` — paged write. The payload is built with
+[`encode_pages`](@ref) (`[crc32c][page ≤4096]` units aligned to the file
+offset). `reqflags = kXR_pgRetry` marks a corrupt-page resend.
+"""
+struct PgWriteRequest <: Request
+    fhandle::NTuple{4,UInt8}
+    offset::Int64
+    data::Vector{UInt8}
+    reqflags::UInt8
+end
+
+function PgWriteRequest(
+    fhandle::NTuple{4,UInt8}, offset::Int64, data::Vector{UInt8}; reqflags::UInt8=0x00
+)
+    return PgWriteRequest(fhandle, offset, data, reqflags)
+end
+
+requestid(::PgWriteRequest) = kXR_pgwrite
+
+function body!(frame::Vector{UInt8}, r::PgWriteRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.offset))
+    frame[17] = 0x00        # pathid
+    frame[18] = r.reqflags
+    return frame
+end
+
+payload(r::PgWriteRequest) = encode_pages(r.data, r.offset)

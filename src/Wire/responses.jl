@@ -141,6 +141,130 @@ function decode_open(body::AbstractVector{UInt8})
 end
 
 """
+    parse_readv(body) -> Vector{@NamedTuple{fhandle::NTuple{4,UInt8}, offset::Int64, data::Vector{UInt8}}}
+
+Walk an accumulated `kXR_readv` response body: per segment, a 16-byte
+`readahead_list` echo header carrying the ACTUAL read length, then that many
+data bytes (libxrdc `xrdc_file_readv`).
+"""
+function parse_readv(body::AbstractVector{UInt8})
+    out = @NamedTuple{fhandle::NTuple{4,UInt8}, offset::Int64, data::Vector{UInt8}}[]
+    cursor = 1
+    while cursor <= length(body)
+        if cursor + 15 > length(body)
+            throw(ArgumentError("truncated readv segment header at byte $cursor"))
+        end
+        fhandle = (body[cursor], body[cursor + 1], body[cursor + 2], body[cursor + 3])
+        rlen = Int(reinterpret(Int32, get_u32(body, cursor + 4)))
+        offset = reinterpret(Int64, get_u64(body, cursor + 8))
+        cursor += 16
+        if cursor + rlen - 1 > length(body)
+            throw(ArgumentError("truncated readv segment data at byte $cursor"))
+        end
+        push!(
+            out, (; fhandle, offset, data=Vector{UInt8}(body[cursor:(cursor + rlen - 1)]))
+        )
+        cursor += rlen
+    end
+    return out
+end
+
+"""
+    decode_status_body(sb) -> (; sid, reqid, resptype, pgdlen, offset)
+
+Decode and CRC-verify the 24-byte `kXR_status` body used by paged I/O:
+`crc32c[4] + streamID[2] + requestid[1] + resptype[1] + reserved[4] +
+pgdlen[4] + offset[8]`; the CRC covers bytes 5:24 (ops_file_pg.c).
+`resptype` is `kXR_FinalResult` or `kXR_PartialResult`; `pgdlen` bytes of
+page data follow the body on the wire.
+"""
+function decode_status_body(sb::AbstractVector{UInt8})
+    if length(sb) < STATUS_BODY_LEN
+        throw(
+            ArgumentError(
+                "kXR_status body needs $(STATUS_BODY_LEN) bytes, got $(length(sb))"
+            ),
+        )
+    end
+    want = get_u32(sb, 1)
+    got = crc32c(Vector{UInt8}(sb[5:STATUS_BODY_LEN]))
+    if want != got
+        throw(ArgumentError("kXR_status header CRC mismatch (got $got, want $want)"))
+    end
+    return (;
+        sid=get_u16(sb, 5),
+        reqid=sb[7],
+        resptype=sb[8],
+        pgdlen=get_u32(sb, 13),
+        offset=reinterpret(Int64, get_u64(sb, 17)),
+    )
+end
+
+"Length of the page starting at file offset `off` with `remaining` bytes left."
+function page_span(off::Int64, remaining::Integer)
+    to_boundary = kXR_pgPageSZ - Int(off & (kXR_pgPageSZ - 1))
+    return min(Int(remaining), to_boundary)
+end
+
+"""
+    encode_pages(data, offset::Int64) -> Vector{UInt8}
+
+Build a paged-I/O payload from `data` starting at file `offset`: units of
+`[crc32c_be 4][page ≤4096]`, page boundaries aligned to the FILE offset
+(short first page when `offset` is not 4 KiB-aligned).
+"""
+function encode_pages(data::AbstractVector{UInt8}, offset::Int64)
+    npages_max = length(data) ÷ kXR_pgPageSZ + 2
+    out = Vector{UInt8}(undef, length(data) + 4 * npages_max)
+    cursor = 1
+    produced = 0
+    off = offset
+    while cursor <= length(data)
+        n = page_span(off, length(data) - cursor + 1)
+        page = view(data, cursor:(cursor + n - 1))
+        set_u32!(out, produced + 1, crc32c(Vector{UInt8}(page)))
+        copyto!(out, produced + 5, page, 1, n)
+        produced += 4 + n
+        cursor += n
+        off += n
+    end
+    resize!(out, produced)
+    return out
+end
+
+"""
+    decode_pages(pg, file_off::Int64) -> Vector{UInt8}
+
+Decode a paged-I/O buffer (`[crc32c][page]` units aligned at `file_off`)
+into plain bytes, verifying every page CRC. Throws `ArgumentError` on a CRC
+mismatch or malformed framing.
+"""
+function decode_pages(pg::AbstractVector{UInt8}, file_off::Int64)
+    out = Vector{UInt8}(undef, length(pg))
+    cursor = 1
+    produced = 0
+    off = file_off
+    while cursor <= length(pg)
+        if cursor + 4 > length(pg)
+            throw(ArgumentError("malformed page framing at byte $cursor"))
+        end
+        want = get_u32(pg, cursor)
+        cursor += 4
+        n = page_span(off, length(pg) - cursor + 1)
+        page = view(pg, cursor:(cursor + n - 1))
+        if crc32c(Vector{UInt8}(page)) != want
+            throw(ArgumentError("page CRC mismatch at file offset $off"))
+        end
+        copyto!(out, produced + 1, page, 1, n)
+        produced += n
+        cursor += n
+        off += n
+    end
+    resize!(out, produced)
+    return out
+end
+
+"""
     parse_locate(body) -> Vector{@NamedTuple{node::Char, access::Char, address::String}}
 
 Parse a `kXR_locate` response: space-separated `XY<host:port>` tokens where

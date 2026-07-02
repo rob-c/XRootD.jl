@@ -118,3 +118,70 @@ using XRootD.Wire: decode_open, parse_locate
         @test !b.has_ext && b.mode == "" && b.owner == ""
     end
 end
+
+using CRC32c: crc32c
+using XRootD.Wire:
+    parse_readv,
+    decode_status_body,
+    encode_pages,
+    decode_pages,
+    set_u16!,
+    set_u32!,
+    set_u64!
+
+"Build a valid 24-byte kXR_status body (crc + sid/reqid/resptype/pgdlen/offset)."
+function status_body(sid, resptype, pgdlen, offset)
+    sb = zeros(UInt8, 24)
+    set_u16!(sb, 5, UInt16(sid))
+    sb[7] = 0x1e                             # requestid echo (pgread - 3000)
+    sb[8] = UInt8(resptype)
+    set_u32!(sb, 13, UInt32(pgdlen))
+    set_u64!(sb, 17, UInt64(offset))
+    set_u32!(sb, 1, crc32c(sb[5:24]))
+    return sb
+end
+
+@testset "Wire vector and paged io responses" begin
+    @testset "readv response walk" begin
+        seg(off, data) = vcat(
+            UInt8[1, 2, 3, 4],
+            Wire.set_u32!(zeros(UInt8, 4), 1, UInt32(length(data))),
+            Wire.set_u64!(zeros(UInt8, 8), 1, UInt64(off)),
+            Vector{UInt8}(codeunits(data)),
+        )
+        segs = parse_readv(vcat(seg(0, "abc"), seg(4096, "de")))
+        @test length(segs) == 2
+        @test segs[1].data == codeunits("abc") && segs[1].offset == 0
+        @test segs[2].data == codeunits("de") && segs[2].offset == 4096
+        @test_throws ArgumentError parse_readv(UInt8[1, 2, 3])
+    end
+
+    @testset "status body decode + CRC" begin
+        sb = status_body(7, 0x01, 4100, 8192)
+        s = decode_status_body(sb)
+        @test s.resptype == 0x01
+        @test s.pgdlen == 4100
+        @test s.offset == 8192
+        sb[24] ⊻= 0xff                        # corrupt → CRC must fail
+        @test_throws ArgumentError decode_status_body(sb)
+        @test_throws ArgumentError decode_status_body(UInt8[0x00])
+    end
+
+    @testset "page encode/decode round trip" begin
+        data = rand(UInt8, 10000)
+        # aligned at 0: pages 4096+4096+1808, each prefixed by 4-byte CRC
+        pg = encode_pages(data, Int64(0))
+        @test length(pg) == 10000 + 3 * 4
+        @test decode_pages(pg, Int64(0)) == data
+
+        # unaligned start: short first page up to the 4 KiB boundary
+        off = Int64(4000)
+        pg = encode_pages(data, off)
+        @test length(pg) == 10000 + 4 * 4     # 96 + 4096 + 4096 + 1712
+        @test decode_pages(pg, off) == data
+
+        # CRC corruption is detected
+        pg[5] ⊻= 0xff
+        @test_throws ArgumentError decode_pages(pg, off)
+    end
+end

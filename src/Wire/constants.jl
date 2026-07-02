@@ -112,6 +112,17 @@ const kXR_Qopaque = UInt16(16)
 const kXR_Qopaquf = UInt16(32)
 const kXR_Qopaqug = UInt16(64)
 
+# ---- kXR_writev options byte ----
+const kXR_wv_doSync = 0x01   # fsync each touched handle after the write
+
+# ---- paged I/O (kXR_pgread / kXR_pgwrite; ops_file_pg.c) ----
+const kXR_pgPageSZ      = 4096   # page size; CRC32c per page
+const kXR_pgRetry       = 0x01   # pgwrite reqflags: resend of a corrupt page
+const kXR_FinalResult   = 0x00   # kXR_status resptype: last frame
+const kXR_PartialResult = 0x01   # kXR_status resptype: more frames follow
+const STATUS_BODY_LEN   = 24     # kXR_status body: crc[4] sid[2] reqid[1]
+                                 # resptype[1] rsvd[4] dlen[4] offset[8]
+
 # ---- stat flags bitfield (flags.h; StatInfo.flags) ----
 const kXR_xset     = UInt32(0x01)  # executable / searchable
 const kXR_isDir    = UInt32(0x02)

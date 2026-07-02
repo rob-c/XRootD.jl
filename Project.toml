@@ -4,8 +4,10 @@ authors = ["Pere Mato <pere.mato@cern.ch>"]
 version = "0.3.0-DEV"
 
 [deps]
+CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
 [compat]
+CRC32c = "1"
 Sockets = "1"
 julia = "1.10"

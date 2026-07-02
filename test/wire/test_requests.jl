@@ -170,3 +170,64 @@ using XRootD.Wire:
         @test w[25:26] == UInt8[0xde, 0xad]
     end
 end
+
+using XRootD.Wire: ReadVRequest, WriteVRequest, PgReadRequest, PgWriteRequest
+using CRC32c: crc32c
+
+@testset "Wire vector and paged io requests" begin
+    fh = (0x01, 0x02, 0x03, 0x04)
+
+    @testset "readv" begin
+        r = encode(
+            ReadVRequest([
+                (; fhandle=fh, offset=Int64(0), rlen=Int32(16)),
+                (; fhandle=fh, offset=Int64(4096), rlen=Int32(32)),
+            ]),
+            UInt16(9),
+        )
+        @test r[3:4] == UInt8[0x0b, 0xd1]        # kXR_readv (3025)
+        @test r[21:24] == UInt8[0, 0, 0, 32]     # dlen = 2 entries x 16
+        @test r[25:28] == UInt8[1, 2, 3, 4]      # entry 1: fhandle
+        @test r[29:32] == UInt8[0, 0, 0, 16]     # entry 1: rlen
+        @test r[33:40] == zeros(UInt8, 8)        # entry 1: offset 0
+        @test r[41:44] == UInt8[1, 2, 3, 4]      # entry 2: fhandle
+        @test r[45:48] == UInt8[0, 0, 0, 32]
+        @test r[49:56] == UInt8[0, 0, 0, 0, 0, 0, 0x10, 0]   # 4096
+    end
+
+    @testset "writev: descriptor block then concatenated data" begin
+        w = encode(
+            WriteVRequest(
+                [(; fhandle=fh, offset=Int64(8), data=UInt8[0xaa, 0xbb])]; do_sync=true
+            ),
+            UInt16(9),
+        )
+        @test w[3:4] == UInt8[0x0b, 0xd7]        # kXR_writev (3031)
+        @test w[5] == 0x01                       # kXR_wv_doSync
+        @test w[21:24] == UInt8[0, 0, 0, 18]     # dlen = 16 + 2
+        @test w[25:28] == UInt8[1, 2, 3, 4]
+        @test w[29:32] == UInt8[0, 0, 0, 2]      # wlen
+        @test w[33:40] == UInt8[0, 0, 0, 0, 0, 0, 0, 8]
+        @test w[41:42] == UInt8[0xaa, 0xbb]
+    end
+
+    @testset "pgread / pgwrite" begin
+        p = encode(PgReadRequest(fh, Int64(4096), Int32(8192)), UInt16(9))
+        @test p[3:4] == UInt8[0x0b, 0xd6]        # kXR_pgread (3030)
+        @test p[5:8] == UInt8[1, 2, 3, 4]
+        @test p[9:16] == UInt8[0, 0, 0, 0, 0, 0, 0x10, 0]
+        @test p[17:20] == UInt8[0, 0, 0x20, 0]
+
+        pw = encode(PgWriteRequest(fh, Int64(0), UInt8[0xde, 0xad]), UInt16(9))
+        @test pw[3:4] == UInt8[0x0b, 0xd2]       # kXR_pgwrite (3026)
+        @test pw[5:8] == UInt8[1, 2, 3, 4]
+        @test pw[9:16] == zeros(UInt8, 8)
+        @test pw[17] == 0x00                     # pathid
+        @test pw[18] == 0x00                     # reqflags
+        # payload is [crc32c][page] units: 4-byte CRC + 2 data bytes
+        @test pw[21:24] == UInt8[0, 0, 0, 6]
+        crc = Wire.get_u32(pw, 25)
+        @test pw[29:30] == UInt8[0xde, 0xad]
+        @test crc == crc32c(UInt8[0xde, 0xad])
+    end
+end

@@ -13,6 +13,8 @@ wire.
 """
 module Wire
 
+using CRC32c: crc32c
+
 include("primitives.jl")
 include("constants.jl")
 include("frames.jl")
