@@ -29,32 +29,32 @@ Plans 01–07 constraints, plus:
 ## Tasks
 
 ### Task 1: Reference-binary harness
-- [ ] `test/parity/harness.jl`: locate the libxrdc binaries
+- [x] `test/parity/harness.jl`: locate the libxrdc binaries
   (`nginx-xrootd/client/bin/`) and the official ones (`XRootD_jll.xrdcp`,
   `XRootD_jll.xrdfs`); helpers to run each and capture stdout/exit code.
   A `parity_available()` gate. Commit `test(parity): reference-binary harness`.
 
 ### Task 2: Data-movement parity
-- [ ] Same file copied to the server by XRootD.jl's `xrdcp` main, the
+- [x] Same file copied to the server by XRootD.jl's `xrdcp` main, the
   official `xrdcp`, and libxrdc's `xrdcp`; assert byte-identical results and
   matching exit codes. Cross-read: each client reads what the others wrote.
   Commit `test(parity): xrdcp data-movement parity`.
 
 ### Task 3: Metadata + checksum parity
-- [ ] `xrdfs ls`/`stat` output compared field-by-field across the three
+- [x] `xrdfs ls`/`stat` output compared field-by-field across the three
   clients; checksum digests (`xrdadler32`/`xrdcrc32c`/`xrdcrc64`) compared
   against the libxrdc tools on the same inputs. Commit
   `test(parity): metadata and checksum parity`.
 
 ### Task 4: Documentation rewrite
-- [ ] Rewrite `docs/src/index.md` and add API pages for the public modules
+- [x] Rewrite `docs/src/index.md` and add API pages for the public modules
   (`XrdCl`, `Storage`, `Tools`); update the README getting-started for the
   native client; a migration note from 0.2.x. Ensure the Documenter build is
   clean (drop `warnonly` where possible). Commit `docs: 0.3 native-client
   documentation`.
 
 ### Task 5: Release prep
-- [ ] Set `version = "0.3.0"`; write `docs/src/release_notes.md` for 0.3;
+- [x] Set `version = "0.3.0"`; write `docs/src/release_notes.md` for 0.3;
   final `Pkg.test()`; update the top-level module docstring's layer list to
   reflect all shipped layers. Commit `release: prepare 0.3.0`.
 

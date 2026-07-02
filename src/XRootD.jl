@@ -8,9 +8,13 @@ As of 0.3, XRootD.jl no longer wraps the XrdCl C++ library. The protocol is
 implemented natively in Julia, in layers:
 
 - [`XRootD.Wire`](@ref) — wire-format codecs (no I/O).
-- `XRootD.Session` — connections, auth, request multiplexing (plan 02).
-- Client `File`/`FileSystem` API, web backends, and tools follow in later
-  plans; see `docs/superpowers/plans/2026-07-02-pure-julia-client-roadmap.md`.
+- `XRootD.Session` — connections, TLS, authentication (unix / bearer token /
+  sss), request multiplexing, and resilience.
+- `XRootD.XrdCl` — the public `File` / `FileSystem` API.
+- `XRootD.Storage` — backend-agnostic storage dispatching on URL scheme
+  (`root(s)://`, `http(s)://`/`dav(s)://`, `s3(s)://`, local paths).
+- `XRootD.Tools` — the copy engine and `xrdcp` / `xrdfs` / checksum CLI
+  equivalents.
 
 ## Attribution
 

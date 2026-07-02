@@ -1,6 +1,33 @@
 
 # Release Notes
 
+## 0.3.0 (07-02-2026)
+- **Pure-Julia rewrite.** The XRootD protocol is now implemented natively in
+  Julia; the CxxWrap binding to the XrdCl C++ library and the `XRootD_jll` /
+  `XRootD_cxxwrap_jll` runtime dependencies are removed (`XRootD_jll` remains
+  a test-only dependency for the server). The `File` / `FileSystem` API and
+  the `(status, result)` convention are unchanged.
+- Layered architecture: `Wire` (codecs) → `Session` (connections, TLS, auth,
+  multiplexing, resilience) → `XrdCl` (public API) → `Storage` (multi-backend
+  dispatch) → `Tools` (copy engine + CLIs).
+- In-protocol TLS via `roots://`.
+- Authentication: unix, WLCG bearer tokens (ztn), and sss shared-secret
+  (pure-Julia Blowfish); `kXR_sigver` request signing for high-security
+  servers.
+- New operations: `sync`, `readv`, `writev`, `pgread`/`pgwrite` (per-page
+  CRC32c), `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statvfs`,
+  `checksum`, `prepare`, `symlink`/`hardlink`/`readlink`.
+- Resilience: redirect following, reconnect-with-replay for idempotent
+  operations, and idle keepalive.
+- Web backends: `http(s)://`, `dav(s)://` (WebDAV), and `s3(s)://` (AWS
+  Signature v4) through a `Storage` abstraction.
+- `Tools`: a backend-agnostic copy engine and Julia equivalents of `xrdcp`,
+  `xrdfs`, `xrdadler32`, `xrdcrc32c`, `xrdcrc64`, and `xrdckverify`
+  (`bin/*.jl`), verified byte-for-byte against the reference clients.
+- Attribution: the protocol understanding and client semantics were
+  developed in the `libxrdc` pure-C client of the nginx-xrootd project;
+  this release is a Julia translation of that work.
+
 ## 0.2.4 (05-02-2026)
 - Fix for #2
 - Fix for #3
