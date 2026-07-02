@@ -89,23 +89,74 @@ function decode_login(body::AbstractVector{UInt8})
 end
 
 """
-    parse_stat_line(line::AbstractString) -> (; id::String, size::Int64, flags::UInt32, mtime::Int64)
+    parse_stat_line(line) -> (; id, size, flags, mtime, ctime, atime, mode, owner, group, has_ext)
 
 Parse the ASCII stat line `"<id> <size> <flags> <mtime>"` returned by
-`kXR_stat` (and per entry by dstat dirlists). Extra fields (extended stat)
-are ignored.
+`kXR_stat` (and per entry by dstat dirlists), including the optional
+extended tail `" <ctime> <atime> <mode-octal> <owner> <group>"` some servers
+append (stat_line.h). Without the tail, `has_ext` is `false` and the
+extended fields are zero/empty.
 """
 function parse_stat_line(line::AbstractString)
     parts = split(rstrip(line, '\0'))
     if length(parts) < 4
         throw(ArgumentError("malformed stat line: $(repr(line))"))
     end
+    has_ext = length(parts) >= 9
     return (;
         id=String(parts[1]),
         size=parse(Int64, parts[2]),
         flags=parse(UInt32, parts[3]),
         mtime=parse(Int64, parts[4]),
+        ctime=has_ext ? parse(Int64, parts[5]) : Int64(0),
+        atime=has_ext ? parse(Int64, parts[6]) : Int64(0),
+        mode=has_ext ? String(parts[7]) : "",
+        owner=has_ext ? String(parts[8]) : "",
+        group=has_ext ? String(parts[9]) : "",
+        has_ext=has_ext,
     )
+end
+
+"""
+    decode_open(body) -> (; fhandle::NTuple{4,UInt8}, cpsize::Int32, stat)
+
+Decode a `kXR_open` response body: the 4-byte file handle, the compression
+page size (0 when the 12-byte form is absent), and — when the open carried
+`kXR_retstat` — the trailing ASCII stat line parsed via
+[`parse_stat_line`](@ref) (`nothing` otherwise).
+"""
+function decode_open(body::AbstractVector{UInt8})
+    if length(body) < 4
+        throw(ArgumentError("kXR_open body needs ≥ 4 bytes, got $(length(body))"))
+    end
+    fhandle = (body[1], body[2], body[3], body[4])
+    cpsize = length(body) >= 8 ? reinterpret(Int32, get_u32(body, 5)) : Int32(0)
+    stat = if length(body) > 12
+        line = get_bounded_string(body, 13, length(body) - 12)
+        isempty(strip(line)) ? nothing : parse_stat_line(line)
+    else
+        nothing
+    end
+    return (; fhandle, cpsize, stat)
+end
+
+"""
+    parse_locate(body) -> Vector{@NamedTuple{node::Char, access::Char, address::String}}
+
+Parse a `kXR_locate` response: space-separated `XY<host:port>` tokens where
+`X` is the node type (`S`/`M` online server/manager, `s`/`m` pending) and
+`Y` the access mode (`r`/`w`).
+"""
+function parse_locate(body::AbstractVector{UInt8})
+    text = rstrip(String(copy(body)), '\0')
+    out = @NamedTuple{node::Char, access::Char, address::String}[]
+    for token in split(text; keepempty=false)
+        if length(token) < 3
+            throw(ArgumentError("malformed locate token: $(repr(token))"))
+        end
+        push!(out, (; node=token[1], access=token[2], address=String(token[3:end])))
+    end
+    return out
 end
 
 # 9-byte prefix the reference client checks to detect dstat mode

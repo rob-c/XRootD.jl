@@ -84,6 +84,43 @@ const kXR_dcksm  = 0x04
 # ---- kXR_stat options ----
 const kXR_vfs = 0x01
 
+# ---- kXR_open options (u16; flags.h) ----
+const kXR_compress  = UInt16(0x0001)
+const kXR_delete    = UInt16(0x0002)  # open for write, truncate to zero
+const kXR_force     = UInt16(0x0004)
+const kXR_new       = UInt16(0x0008)  # fail if the file exists
+const kXR_open_read = UInt16(0x0010)
+const kXR_open_updt = UInt16(0x0020)  # O_RDWR
+const kXR_refresh   = UInt16(0x0080)
+const kXR_mkpath    = UInt16(0x0100)  # create parent directories
+const kXR_open_apnd = UInt16(0x0200)
+const kXR_retstat   = UInt16(0x0400)  # return stat info with the open reply
+const kXR_open_wrto = UInt16(0x8000)  # write-only
+
+# ---- kXR_mkdir options byte ----
+const kXR_mkdirpath = 0x01
+
+# ---- kXR_query infotype (XQueryType; opcodes.h) ----
+const kXR_QStats  = UInt16(1)
+const kXR_QPrep   = UInt16(2)
+const kXR_Qcksum  = UInt16(3)
+const kXR_Qxattr  = UInt16(4)
+const kXR_Qspace  = UInt16(5)
+const kXR_Qconfig = UInt16(7)
+const kXR_Qvisa   = UInt16(8)
+const kXR_Qopaque = UInt16(16)
+const kXR_Qopaquf = UInt16(32)
+const kXR_Qopaqug = UInt16(64)
+
+# ---- stat flags bitfield (flags.h; StatInfo.flags) ----
+const kXR_xset     = UInt32(0x01)  # executable / searchable
+const kXR_isDir    = UInt32(0x02)
+const kXR_other    = UInt32(0x04)  # neither regular file nor directory
+const kXR_offline  = UInt32(0x08)
+const kXR_readable = UInt32(0x10)
+const kXR_writable = UInt32(0x20)
+const kXR_poscpend = UInt32(0x40)
+
 #! format: on
 
 const _REQUEST_NAMES = Dict{UInt16,String}(

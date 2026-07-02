@@ -57,7 +57,10 @@ using XRootD.Wire:
 
     @testset "stat line" begin
         s = parse_stat_line("1234567 16 65536 1700000000")
-        @test s == (; id="1234567", size=16, flags=UInt32(65536), mtime=1700000000)
+        @test s.id == "1234567"
+        @test s.size == 16
+        @test s.flags == UInt32(65536)
+        @test s.mtime == 1700000000
         @test parse_stat_line("9 0 0 0\0").size == 0     # tolerate trailing NUL
         @test_throws ArgumentError parse_stat_line("only two")
     end
@@ -70,10 +73,48 @@ using XRootD.Wire:
         dstat_text = ".\n0 0 0 0\nf1\n10 100 0 1700000000\ndir1\n11 0 19 1700000001\0"
         ds = parse_dirlist(Vector{UInt8}(codeunits(dstat_text)))
         @test ds.entries == ["f1", "dir1"]
-        @test ds.stats[1] == (; id="10", size=100, flags=UInt32(0), mtime=1700000000)
+        @test ds.stats[1].id == "10"
+        @test ds.stats[1].size == 100
+        @test ds.stats[1].mtime == 1700000000
         @test ds.stats[2].flags == UInt32(19)
 
         empty = parse_dirlist(UInt8[])
         @test empty.entries == String[] && empty.stats === nothing
+    end
+end
+
+using XRootD.Wire: decode_open, parse_locate
+
+@testset "Wire fs/file response bodies" begin
+    @testset "open body" begin
+        body = UInt8[0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0]
+        o = decode_open(body)
+        @test o.fhandle == (0x01, 0x02, 0x03, 0x04)
+        @test o.stat === nothing
+        withstat = vcat(body, Vector{UInt8}(codeunits("7 13 51 1700000000\0")))
+        o = decode_open(withstat)
+        @test o.stat.size == 13
+        @test decode_open(UInt8[1, 2, 3, 4]).fhandle == (0x01, 0x02, 0x03, 0x04)
+        @test_throws ArgumentError decode_open(UInt8[1, 2])
+    end
+
+    @testset "locate tokens" begin
+        locs = parse_locate(
+            Vector{UInt8}(codeunits("Sr[::127.0.0.1]:1094 Mw[::10.0.0.1]:1094\0"))
+        )
+        @test length(locs) == 2
+        @test locs[1].node == 'S' && locs[1].access == 'r'
+        @test locs[1].address == "[::127.0.0.1]:1094"
+        @test locs[2].node == 'M' && locs[2].access == 'w'
+        @test isempty(parse_locate(UInt8[]))
+    end
+
+    @testset "extended stat line" begin
+        s = parse_stat_line("123 13 51 1700000000 1700000001 1700000002 0644 rob users")
+        @test s.has_ext
+        @test s.mode == "0644" && s.owner == "rob" && s.group == "users"
+        @test s.ctime == 1700000001 && s.atime == 1700000002
+        b = parse_stat_line("123 13 51 1700000000")
+        @test !b.has_ext && b.mode == "" && b.owner == ""
     end
 end

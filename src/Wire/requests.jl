@@ -156,3 +156,280 @@ function body!(frame::Vector{UInt8}, r::DirlistRequest)
 end
 
 payload(r::DirlistRequest) = codeunits(r.path)
+
+# ---- filesystem mutations (wire_write_extended_requests.h) ----
+
+"""
+    MkdirRequest(path; mode::UInt16 = 0x0000, mkpath::Bool = false)
+
+`kXR_mkdir` — create a directory with POSIX permission bits `mode`;
+`mkpath` creates missing parents (`kXR_mkdirpath`).
+"""
+struct MkdirRequest <: Request
+    path::String
+    mode::UInt16
+    mkpath::Bool
+end
+
+function MkdirRequest(path::AbstractString; mode::UInt16=0x0000, mkpath::Bool=false)
+    return MkdirRequest(String(path), mode, mkpath)
+end
+
+requestid(::MkdirRequest) = kXR_mkdir
+
+function body!(frame::Vector{UInt8}, r::MkdirRequest)
+    frame[5] = r.mkpath ? kXR_mkdirpath : 0x00
+    set_u16!(frame, 19, r.mode)
+    return frame
+end
+
+payload(r::MkdirRequest) = codeunits(r.path)
+
+"""
+    RmRequest(path)
+
+`kXR_rm` — delete a file.
+"""
+struct RmRequest <: Request
+    path::String
+end
+
+RmRequest(path::AbstractString) = RmRequest(String(path))
+requestid(::RmRequest) = kXR_rm
+payload(r::RmRequest) = codeunits(r.path)
+
+"""
+    RmdirRequest(path)
+
+`kXR_rmdir` — remove an empty directory.
+"""
+struct RmdirRequest <: Request
+    path::String
+end
+
+RmdirRequest(path::AbstractString) = RmdirRequest(String(path))
+requestid(::RmdirRequest) = kXR_rmdir
+payload(r::RmdirRequest) = codeunits(r.path)
+
+"""
+    MvRequest(src, dst)
+
+`kXR_mv` — rename/move. Wire payload is `src * " " * dst` with
+`arg1len = ncodeunits(src)` in body bytes 15:16 (libxrdc `ops_fs.c`).
+"""
+struct MvRequest <: Request
+    src::String
+    dst::String
+end
+
+MvRequest(src::AbstractString, dst::AbstractString) = MvRequest(String(src), String(dst))
+requestid(::MvRequest) = kXR_mv
+
+function body!(frame::Vector{UInt8}, r::MvRequest)
+    set_u16!(frame, 19, UInt16(ncodeunits(r.src)))
+    return frame
+end
+
+payload(r::MvRequest) = codeunits(r.src * " " * r.dst)
+
+"""
+    ChmodRequest(path, mode::UInt16)
+
+`kXR_chmod` — set POSIX permission bits (the kXR mode bits equal the low 9
+POSIX bits, so octal literals pass through unchanged).
+"""
+struct ChmodRequest <: Request
+    path::String
+    mode::UInt16
+end
+
+function ChmodRequest(path::AbstractString, mode::UInt16)
+    return ChmodRequest(String(path), mode)
+end
+
+requestid(::ChmodRequest) = kXR_chmod
+
+function body!(frame::Vector{UInt8}, r::ChmodRequest)
+    set_u16!(frame, 19, r.mode)
+    return frame
+end
+
+payload(r::ChmodRequest) = codeunits(r.path)
+
+"""
+    TruncateRequest(path, size::Int64)
+
+`kXR_truncate` — truncate a file by path to `size` bytes. (Handle-based
+truncation of an open file uses the fhandle field with an empty path.)
+"""
+struct TruncateRequest <: Request
+    path::String
+    size::Int64
+    fhandle::NTuple{4,UInt8}
+end
+
+function TruncateRequest(path::AbstractString, size::Integer)
+    return TruncateRequest(String(path), Int64(size), (0x00, 0x00, 0x00, 0x00))
+end
+
+requestid(::TruncateRequest) = kXR_truncate
+
+function body!(frame::Vector{UInt8}, r::TruncateRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.size))
+    return frame
+end
+
+payload(r::TruncateRequest) = codeunits(r.path)
+
+"""
+    LocateRequest(path; options::UInt16 = 0x0000)
+
+`kXR_locate` — list replica locations. Response: space-separated
+`XY<host:port>` tokens (see [`parse_locate`](@ref)).
+"""
+struct LocateRequest <: Request
+    path::String
+    options::UInt16
+end
+
+function LocateRequest(path::AbstractString; options::UInt16=0x0000)
+    return LocateRequest(String(path), options)
+end
+
+requestid(::LocateRequest) = kXR_locate
+
+function body!(frame::Vector{UInt8}, r::LocateRequest)
+    set_u16!(frame, 5, r.options)
+    return frame
+end
+
+payload(r::LocateRequest) = codeunits(r.path)
+
+"""
+    QueryRequest(infotype::UInt16, args)
+
+`kXR_query` — query server information: `kXR_QStats`, `kXR_Qspace`,
+`kXR_Qcksum`, `kXR_Qconfig`, ... `args` is the query argument text.
+"""
+struct QueryRequest <: Request
+    infotype::UInt16
+    args::String
+end
+
+function QueryRequest(infotype::UInt16, args::AbstractString)
+    return QueryRequest(infotype, String(args))
+end
+
+requestid(::QueryRequest) = kXR_query
+
+function body!(frame::Vector{UInt8}, r::QueryRequest)
+    set_u16!(frame, 5, r.infotype)
+    return frame
+end
+
+payload(r::QueryRequest) = codeunits(r.args)
+
+# ---- file access (wire_core_requests.h) ----
+
+"""
+    OpenRequest(path; mode::UInt16 = 0x0000, options::UInt16)
+
+`kXR_open` — open `path`. `options` composes `kXR_open_read`,
+`kXR_open_updt`, `kXR_new`, `kXR_delete` (truncate), `kXR_mkpath`,
+`kXR_retstat`, ...; `mode` sets permission bits for created files.
+Response: [`decode_open`](@ref).
+"""
+struct OpenRequest <: Request
+    path::String
+    mode::UInt16
+    options::UInt16
+end
+
+function OpenRequest(path::AbstractString; mode::UInt16=0x0000, options::UInt16)
+    return OpenRequest(String(path), mode, options)
+end
+
+requestid(::OpenRequest) = kXR_open
+
+function body!(frame::Vector{UInt8}, r::OpenRequest)
+    set_u16!(frame, 5, r.mode)
+    set_u16!(frame, 7, r.options)
+    return frame
+end
+
+payload(r::OpenRequest) = codeunits(r.path)
+
+"""
+    ReadRequest(fhandle, offset::Int64, rlen::Int32)
+
+`kXR_read` — read `rlen` bytes at `offset` from the open file `fhandle`.
+Response body: the raw bytes (large reads arrive chunked via `kXR_oksofar`).
+"""
+struct ReadRequest <: Request
+    fhandle::NTuple{4,UInt8}
+    offset::Int64
+    rlen::Int32
+end
+
+requestid(::ReadRequest) = kXR_read
+
+function body!(frame::Vector{UInt8}, r::ReadRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.offset))
+    set_u32!(frame, 17, reinterpret(UInt32, r.rlen))
+    return frame
+end
+
+"""
+    WriteRequest(fhandle, offset::Int64, data::Vector{UInt8})
+
+`kXR_write` — write `data` at `offset` to the open file `fhandle`.
+"""
+struct WriteRequest <: Request
+    fhandle::NTuple{4,UInt8}
+    offset::Int64
+    data::Vector{UInt8}
+end
+
+requestid(::WriteRequest) = kXR_write
+
+function body!(frame::Vector{UInt8}, r::WriteRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.offset))
+    return frame
+end
+
+payload(r::WriteRequest) = r.data
+
+"""
+    CloseRequest(fhandle)
+
+`kXR_close` — close an open file handle.
+"""
+struct CloseRequest <: Request
+    fhandle::NTuple{4,UInt8}
+end
+
+requestid(::CloseRequest) = kXR_close
+
+function body!(frame::Vector{UInt8}, r::CloseRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    return frame
+end
+
+"""
+    SyncRequest(fhandle)
+
+`kXR_sync` — fsync an open file handle.
+"""
+struct SyncRequest <: Request
+    fhandle::NTuple{4,UInt8}
+end
+
+requestid(::SyncRequest) = kXR_sync
+
+function body!(frame::Vector{UInt8}, r::SyncRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    return frame
+end
