@@ -10,4 +10,5 @@ using XRootD
     include("wire/test_frames.jl")
     include("wire/test_requests.jl")
     include("wire/test_responses.jl")
+    include("test_quality.jl")
 end

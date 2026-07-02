@@ -8,14 +8,26 @@ on:
       - main
     tags: '*'
 jobs:
+  format:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - run: |
+          julia -e '
+            using Pkg; Pkg.add("JuliaFormatter"); using JuliaFormatter
+            format(".", verbose=true) || error("Run JuliaFormatter before pushing")'
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         version:
-          - '1.9'
+          - '1.10'
           - '1' # Leave this line unchanged. '1' will automatically expand to the latest stable 1.x release of Julia.
         os:
           - ubuntu-latest
@@ -27,13 +39,11 @@ jobs:
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v2 
+      - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         env:
           JULIA_NUM_THREADS: "3"
-        with:
-          prefix: xvfb-run
       - uses: julia-actions/julia-processcoverage@v1
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4
@@ -43,6 +53,8 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -53,12 +65,6 @@ jobs:
             using Pkg
             Pkg.develop(PackageSpec(path=pwd()))
             Pkg.instantiate()'
-      - run: |
-          julia --project=docs -e '
-            using Documenter: DocMeta, doctest
-            using XRootD
-            DocMeta.setdocmeta!(XRootD, :DocTestSetup, :(using XRootD); recursive=true)
-            doctest(XRootD)'
       - run: julia --project=docs docs/make.jl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
