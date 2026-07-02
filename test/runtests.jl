@@ -46,6 +46,8 @@ end
                 include("integration/test_extended.jl")
                 include("integration/test_tools.jl")
                 include("integration/test_tls.jl")
+                include("parity/harness.jl")
+                include("parity/test_parity.jl")
             finally
                 kill(xrootd_server)
             end
