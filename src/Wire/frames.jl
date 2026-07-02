@@ -54,26 +54,39 @@ body!(frame::Vector{UInt8}, ::Request) = frame
 """
     payload(req::Request) -> AbstractVector{UInt8}
 
-The payload bytes that follow the 24-byte header (default: none).
+The payload bytes that follow the 24-byte header and are counted in `dlen`
+(default: none).
 """
 payload(::Request) = UInt8[]
+
+"""
+    trailer(req::Request) -> AbstractVector{UInt8}
+
+Bytes streamed after the payload but NOT counted in `dlen` (default: none).
+The protocol uses this shape for `kXR_writev`, whose `dlen` covers only the
+descriptor list while the write data follows on the link.
+"""
+trailer(::Request) = UInt8[]
 
 """
     encode(req::Request, streamid::UInt16) -> Vector{UInt8}
 
 Serialize `req` as a complete wire frame: 24-byte `ClientRequestHdr`
-(streamid, opcode, 16 parameter bytes, dlen) followed by the payload.
-`streamid` is owned by the Session layer, which stamps each in-flight
-request with a distinct id and matches responses back by it.
+(streamid, opcode, 16 parameter bytes, dlen), the payload, and any
+[`trailer`](@ref) bytes. `streamid` is owned by the Session layer, which
+stamps each in-flight request with a distinct id and matches responses back
+by it.
 """
 function encode(req::Request, streamid::UInt16)
     pl = payload(req)
-    frame = zeros(UInt8, REQUEST_HDRLEN + length(pl))
+    tr = trailer(req)
+    frame = zeros(UInt8, REQUEST_HDRLEN + length(pl) + length(tr))
     set_u16!(frame, 1, streamid)
     set_u16!(frame, 3, requestid(req))
     body!(frame, req)
     set_u32!(frame, 21, UInt32(length(pl)))
     isempty(pl) || set_bytes!(frame, REQUEST_HDRLEN + 1, pl)
+    isempty(tr) || set_bytes!(frame, REQUEST_HDRLEN + length(pl) + 1, tr)
     return frame
 end
 

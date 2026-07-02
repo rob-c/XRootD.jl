@@ -472,11 +472,13 @@ end
 """
     WriteVRequest(segments::Vector{WriteVSegment}; do_sync::Bool=false)
 
-`kXR_writev` — scatter-gather write, all-or-nothing. The payload is the
-16-byte `write_list` descriptor block back-to-back, FOLLOWED by the
-concatenated data for every segment (the server recovers the count from
-`n*16 + sum(wlen) == dlen`; libxrdc `xrdc_file_writev`). `do_sync` sets
-`kXR_wv_doSync` (fsync each touched handle).
+`kXR_writev` — scatter-gather write, all-or-nothing. Per the official
+protocol, `dlen` covers ONLY the `write_list` descriptor block (stock
+servers enforce `dlen % 16 == 0` and answer `kXR_ArgInvalid: "Write vector
+is invalid"` otherwise); the concatenated segment data streams after the
+frame as a [`trailer`](@ref). Note libxrdc `xrdc_file_writev` counts the
+data inside `dlen`, which only its own server accepts — a parity finding
+discovered against stock xrootd 5.8. `do_sync` sets `kXR_wv_doSync`.
 """
 struct WriteVRequest <: Request
     segments::Vector{WriteVSegment}
@@ -495,18 +497,18 @@ function body!(frame::Vector{UInt8}, r::WriteVRequest)
 end
 
 function payload(r::WriteVRequest)
-    ndesc = 16 * length(r.segments)
-    pl = zeros(UInt8, ndesc + sum(seg -> length(seg.data), r.segments))
-    cursor = ndesc + 1
+    pl = zeros(UInt8, 16 * length(r.segments))
     for (i, seg) in enumerate(r.segments)
         off = 16 * (i - 1) + 1
         set_bytes!(pl, off, collect(seg.fhandle))
         set_u32!(pl, off + 4, UInt32(length(seg.data)))
         set_u64!(pl, off + 8, reinterpret(UInt64, seg.offset))
-        set_bytes!(pl, cursor, seg.data)
-        cursor += length(seg.data)
     end
     return pl
+end
+
+function trailer(r::WriteVRequest)
+    return reduce(vcat, (seg.data for seg in r.segments); init=UInt8[])
 end
 
 # ---- paged I/O (per-page CRC32c; libxrdc ops_file_pg.c) ----

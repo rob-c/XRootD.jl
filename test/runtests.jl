@@ -37,6 +37,8 @@ end
             try
                 @test wait_for_server(1094)
                 include("legacy/testFileSystem.jl")
+                include("legacy/testFile.jl")
+                include("integration/test_file_v5.jl")
             finally
                 kill(xrootd_server)
             end

@@ -195,7 +195,7 @@ using CRC32c: crc32c
         @test r[49:56] == UInt8[0, 0, 0, 0, 0, 0, 0x10, 0]   # 4096
     end
 
-    @testset "writev: descriptor block then concatenated data" begin
+    @testset "writev: dlen covers descriptors only, data streams after" begin
         w = encode(
             WriteVRequest(
                 [(; fhandle=fh, offset=Int64(8), data=UInt8[0xaa, 0xbb])]; do_sync=true
@@ -204,11 +204,23 @@ using CRC32c: crc32c
         )
         @test w[3:4] == UInt8[0x0b, 0xd7]        # kXR_writev (3031)
         @test w[5] == 0x01                       # kXR_wv_doSync
-        @test w[21:24] == UInt8[0, 0, 0, 18]     # dlen = 16 + 2
+        @test w[21:24] == UInt8[0, 0, 0, 16]     # dlen = descriptor list ONLY
         @test w[25:28] == UInt8[1, 2, 3, 4]
         @test w[29:32] == UInt8[0, 0, 0, 2]      # wlen
         @test w[33:40] == UInt8[0, 0, 0, 0, 0, 0, 0, 8]
-        @test w[41:42] == UInt8[0xaa, 0xbb]
+        @test w[41:42] == UInt8[0xaa, 0xbb]      # data trailer (outside dlen)
+        @test length(w) == 24 + 16 + 2
+
+        w2 = encode(
+            WriteVRequest([
+                (; fhandle=fh, offset=Int64(0), data=UInt8[0x01]),
+                (; fhandle=fh, offset=Int64(1), data=UInt8[0x02, 0x03]),
+            ]),
+            UInt16(9),
+        )
+        @test w2[21:24] == UInt8[0, 0, 0, 32]    # two descriptors
+        @test w2[41:44] == UInt8[1, 2, 3, 4]     # segment 2 descriptor
+        @test w2[57:59] == UInt8[0x01, 0x02, 0x03]  # concatenated data trailer
     end
 
     @testset "pgread / pgwrite" begin
