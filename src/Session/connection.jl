@@ -135,6 +135,14 @@ function reader_loop(conn::Connection)
             hdr, body = read_frame(conn.sock)
             if hdr.status == Wire.kXR_attn
                 handle_attn(conn, body)
+            elseif hdr.status == Wire.kXR_status
+                # Paged-io frames carry page data BEYOND hdr.dlen: the 24-byte
+                # status body announces pgdlen trailing bytes (ops_file_pg.c).
+                if length(body) >= Wire.STATUS_BODY_LEN
+                    pgdlen = Wire.get_u32(body, 13)
+                    pgdlen > 0 && append!(body, read(conn.sock, Int(pgdlen)))
+                end
+                deliver(conn, hdr, body)
             else
                 deliver(conn, hdr, body)
             end
@@ -235,6 +243,12 @@ function roundtrip(conn::Connection, req::Wire.Request)
             hdr, body = take!(ch)
             if hdr.status == Wire.kXR_oksofar
                 append!(acc, body)
+            elseif hdr.status == Wire.kXR_status
+                # Paged-io: accumulate whole (status body + pages) frames until
+                # the Final one; the caller walks the self-describing frames.
+                resptype = length(body) >= 8 ? body[8] : Wire.kXR_FinalResult
+                append!(acc, body)
+                resptype == Wire.kXR_PartialResult || return hdr, acc
             elseif hdr.status == Wire.kXR_wait
                 sleep(Wire.wait_seconds(body))
                 send(conn, frame)

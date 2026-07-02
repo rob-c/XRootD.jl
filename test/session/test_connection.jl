@@ -1,4 +1,5 @@
 using Sockets
+using CRC32c: crc32c
 using XRootD: Wire, Session
 
 # Byte helpers for scripting the mock server.
@@ -11,6 +12,18 @@ function resp_hdr(sid::UInt16, status::UInt16, dlen::Integer)
 end
 
 be32(v::Integer) = Wire.set_u32!(zeros(UInt8, 4), 1, UInt32(v))
+
+"One complete kXR_status wire frame: hdr(dlen=24) + CRC'd body + page trailer."
+function status_frame(sid::UInt16, resptype::UInt8, offset::Integer, pages::Vector{UInt8})
+    sb = zeros(UInt8, 24)
+    Wire.set_u16!(sb, 5, sid)
+    sb[7] = 0x1e                          # requestid echo (pgread - 3000)
+    sb[8] = resptype
+    Wire.set_u32!(sb, 13, UInt32(length(pages)))
+    Wire.set_u64!(sb, 17, UInt64(offset))
+    Wire.set_u32!(sb, 1, crc32c(sb[5:24]))
+    return vcat(resp_hdr(sid, Wire.kXR_status, 24), sb, pages)
+end
 
 req_sid(frame::Vector{UInt8}) = Wire.get_u16(frame, 1)
 req_id(frame::Vector{UInt8}) = Wire.get_u16(frame, 3)
@@ -68,6 +81,12 @@ function start_mock_server()
                 elseif rid == Wire.kXR_rm
                     body = vcat(be32(3011), Vector{UInt8}(codeunits("not found")))
                     write(sock, vcat(resp_hdr(sid, Wire.kXR_error, length(body)), body))
+                elseif rid == Wire.kXR_pgread
+                    # two status frames: Partial ("Hello" @0), Final ("World" @5)
+                    p1 = Wire.encode_pages(Vector{UInt8}(codeunits("Hello")), Int64(0))
+                    write(sock, status_frame(sid, Wire.kXR_PartialResult, 0, p1))
+                    p2 = Wire.encode_pages(Vector{UInt8}(codeunits("World")), Int64(5))
+                    write(sock, status_frame(sid, Wire.kXR_FinalResult, 5, p2))
                 elseif rid == Wire.kXR_sync
                     # never answered — exercises close() failing pending requests
                 end
@@ -117,6 +136,23 @@ end
         err = Wire.decode_error(body)
         @test err.errnum == 3011
         @test err.message == "not found"
+    end
+
+    @testset "paged-io status framing" begin
+        fh = (0x00, 0x00, 0x00, 0x00)
+        hdr, body = Session.roundtrip(conn, Wire.PgReadRequest(fh, Int64(0), Int32(10)))
+        @test hdr.status == Wire.kXR_status
+        # body = two concatenated (24-byte status body + pages) frames
+        s1 = Wire.decode_status_body(body[1:24])
+        @test s1.resptype == Wire.kXR_PartialResult
+        @test s1.offset == 0
+        d1 = Wire.decode_pages(body[25:(24 + s1.pgdlen)], s1.offset)
+        cursor = 24 + Int(s1.pgdlen)
+        s2 = Wire.decode_status_body(body[(cursor + 1):(cursor + 24)])
+        @test s2.resptype == Wire.kXR_FinalResult
+        @test s2.offset == 5
+        d2 = Wire.decode_pages(body[(cursor + 25):end], s2.offset)
+        @test String(vcat(d1, d2)) == "HelloWorld"
     end
 
     @testset "close fails pending requests" begin

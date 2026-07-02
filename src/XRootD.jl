@@ -25,4 +25,7 @@ include("Wire/Wire.jl")
 include("Session/Session.jl")
 include("Client/XrdCl.jl")
 
+using Sockets: Sockets
+include("precompile.jl")
+
 end # module XRootD
