@@ -124,6 +124,26 @@ const kXR_wv_doSync = 0x01   # fsync each touched handle after the write
 const kXR_SHA256_sig = 0x01  # HMAC algorithm is HMAC-SHA256
 const kXR_nodata_sig = 0x01  # payload NOT included in the HMAC
 
+# ---- kXR_fattr subcodes + options (opcodes.h / flags.h) ----
+const kXR_fattrDel  = 0x00
+const kXR_fattrGet  = 0x01
+const kXR_fattrList = 0x02
+const kXR_fattrSet  = 0x03
+const kXR_fa_isNew  = 0x01   # (set) fail if the attribute already exists
+const kXR_fa_aData  = 0x10   # (list) include values in the response
+
+# ---- kXR_prepare options byte (flags.h) ----
+const kXR_cancel = 0x01
+const kXR_notify = 0x02
+const kXR_noerrs = 0x04
+const kXR_stage  = 0x08
+const kXR_wmode  = 0x10
+
+# ---- kXR_setattr (vendor ext) ----
+const kXR_sa_times = Int32(0x01)   # apply atime/mtime
+const kXR_sa_owner = Int32(0x02)   # apply uid/gid
+const SETATTR_PREFIX_LEN = 44
+
 # ---- paged I/O (kXR_pgread / kXR_pgwrite; ops_file_pg.c) ----
 const kXR_pgPageSZ      = 4096   # page size; CRC32c per page
 const kXR_pgRetry       = 0x01   # pgwrite reqflags: resend of a corrupt page

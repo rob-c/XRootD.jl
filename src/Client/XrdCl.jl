@@ -18,6 +18,8 @@ using ..Session
 export XRootDStatus, isOK, isError
 export FileSystem, ping, locate, query, rmdir, protocol
 export File, sync, readv, writev, pgread, pgwrite
+export getxattr, setxattr, listxattr, removexattr, statvfs, checksum, prepare
+export symlink, hardlink, readlink
 export isExecutable, isOffline
 export OpenFlags, Access, DirListFlags, QueryCode, MkDirFlags
 

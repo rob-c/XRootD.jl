@@ -311,3 +311,62 @@ function parse_dirlist(body::AbstractVector{UInt8})
     end
     return (; entries=String.(lines), stats=nothing)
 end
+
+# ---- extended-operation response decoders ----
+
+"""
+    parse_fattr_get(body, nattr) -> Vector{@NamedTuple{rc::UInt16, value::Vector{UInt8}}}
+
+Decode a `kXR_fattr` Get response: `[u8 errcount][u8 numattr]` then an nvec
+of `[int16 rc][name\\0]` (names discarded) followed by a vvec of
+`[int32 BE vlen][value]`, one per attribute (libxrdc `fattr.c`).
+"""
+function parse_fattr_get(body::AbstractVector{UInt8}, nattr::Integer)
+    length(body) < 2 && throw(ArgumentError("kXR_fattr Get body too short"))
+    cur = 3                                   # skip errcount, numattr
+    rcs = UInt16[]
+    for _ in 1:nattr
+        push!(rcs, get_u16(body, cur))
+        cur += 2
+        z = findnext(==(0x00), body, cur)
+        cur = (z === nothing ? length(body) : z) + 1
+    end
+    out = @NamedTuple{rc::UInt16, value::Vector{UInt8}}[]
+    for i in 1:nattr
+        if cur + 3 > length(body)
+            push!(out, (; rc=rcs[i], value=UInt8[]))
+            continue
+        end
+        vlen = Int(get_u32(body, cur))
+        cur += 4
+        val = Vector{UInt8}(body[cur:min(cur + vlen - 1, length(body))])
+        cur += vlen
+        push!(out, (; rc=rcs[i], value=val))
+    end
+    return out
+end
+
+"""
+    parse_fattr_list(body) -> Vector{String}
+
+Decode a `kXR_fattr` List response: a NUL-separated attribute-name list.
+"""
+function parse_fattr_list(body::AbstractVector{UInt8})
+    text = rstrip(String(copy(body)), '\0')
+    isempty(text) && return String[]
+    return String.(split(text, '\0'; keepempty=false))
+end
+
+"""
+    parse_statvfs(body) -> (; raw::String, nodes, free_kb, utilization)
+
+Parse a `kXR_stat`-with-`kXR_vfs` response. The oss space report is
+whitespace-separated numeric fields; the raw string is always returned, with
+the leading numeric fields parsed when present.
+"""
+function parse_statvfs(body::AbstractVector{UInt8})
+    raw = rstrip(String(copy(body)), '\0')
+    parts = split(raw)
+    num(i) = length(parts) >= i ? tryparse(Int64, parts[i]) : nothing
+    return (; raw, nodes=num(1), free_kb=num(2), utilization=num(3))
+end

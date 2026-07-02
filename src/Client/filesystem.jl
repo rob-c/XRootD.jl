@@ -324,3 +324,131 @@ function Base.copy(fs::FileSystem, src::String, dest::String; force::Bool=false)
     isOK(st) && (st = close_st)
     return st, nothing
 end
+
+# ---- extended operations (plan 05) ----
+
+"""
+    getxattr(fs::FileSystem, path::String, name::String)
+
+Read one extended attribute. Returns `(status, Vector{UInt8} | nothing)`.
+"""
+function getxattr(fs::FileSystem, path::String, name::String)
+    st, body = perform(fs, Wire.FattrRequest(Wire.kXR_fattrGet, path; names=[name]))
+    isOK(st) || return st, nothing
+    results = Wire.parse_fattr_get(body, 1)
+    isempty(results) && return st, nothing
+    return st, results[1].value
+end
+
+"""
+    setxattr(fs::FileSystem, path::String, name::String, value::Vector{UInt8})
+
+Create or overwrite one extended attribute. Returns `(status, nothing)`.
+"""
+function setxattr(fs::FileSystem, path::String, name::String, value::Vector{UInt8})
+    st, _ = perform(
+        fs, Wire.FattrRequest(Wire.kXR_fattrSet, path; names=[name], values=[value])
+    )
+    return st, nothing
+end
+
+"""
+    listxattr(fs::FileSystem, path::String)
+
+List extended-attribute names. Returns `(status, Vector{String} | nothing)`.
+"""
+function listxattr(fs::FileSystem, path::String)
+    st, body = perform(fs, Wire.FattrRequest(Wire.kXR_fattrList, path))
+    isOK(st) || return st, nothing
+    return st, Wire.parse_fattr_list(body)
+end
+
+"""
+    removexattr(fs::FileSystem, path::String, name::String)
+
+Delete one extended attribute. Returns `(status, nothing)`.
+"""
+function removexattr(fs::FileSystem, path::String, name::String)
+    st, _ = perform(fs, Wire.FattrRequest(Wire.kXR_fattrDel, path; names=[name]))
+    return st, nothing
+end
+
+"""
+    statvfs(fs::FileSystem, path::String)
+
+Query virtual-filesystem (space) information. Returns
+`(status, NamedTuple | nothing)` with `raw`/`nodes`/`free_kb`/`utilization`.
+"""
+function statvfs(fs::FileSystem, path::String)
+    st, body = perform(fs, Wire.StatRequest(path; options=Wire.kXR_vfs))
+    isOK(st) || return st, nothing
+    return st, Wire.parse_statvfs(body)
+end
+
+"""
+    checksum(fs::FileSystem, path::String)
+
+Query the server's checksum for `path` (`kXR_query`/`kXR_Qcksum`). Returns
+`(status, String | nothing)` — typically `"<algo> <hexdigest>"`.
+"""
+function checksum(fs::FileSystem, path::String)
+    st, body = perform(fs, Wire.QueryRequest(Wire.kXR_Qcksum, path))
+    isOK(st) || return st, nothing
+    return st, rstrip(String(copy(body)), '\0')
+end
+
+"""
+    prepare(fs::FileSystem, paths::Vector{String}; stage=true, evict=false, cancel=false)
+
+Issue a `kXR_prepare` for `paths`. Returns `(status, String | nothing)`
+(the response is an opaque request handle for staging).
+"""
+function prepare(
+    fs::FileSystem,
+    paths::Vector{String};
+    stage::Bool=true,
+    evict::Bool=false,
+    cancel::Bool=false,
+)
+    options = 0x00
+    stage && (options |= Wire.kXR_stage)
+    cancel && (options |= Wire.kXR_cancel)
+    optionX = evict ? UInt16(0x0001) : UInt16(0x0000)
+    st, body = perform(fs, Wire.PrepareRequest(paths; options, optionX))
+    isOK(st) || return st, nothing
+    return st, rstrip(String(copy(body)), '\0')
+end
+
+"""
+    symlink(fs::FileSystem, target::String, link::String)
+
+Create a symbolic link `link` → `target` (vendor extension; requires a
+server advertising `xrdfs.ext`). Returns `(status, nothing)`.
+"""
+function symlink(fs::FileSystem, target::String, link::String)
+    st, _ = perform(fs, Wire.SymlinkRequest(target, link))
+    return st, nothing
+end
+
+"""
+    hardlink(fs::FileSystem, oldpath::String, newpath::String)
+
+Create a hard link `newpath` → `oldpath` (vendor extension). Returns
+`(status, nothing)`.
+"""
+function hardlink(fs::FileSystem, oldpath::String, newpath::String)
+    st, _ = perform(fs, Wire.LinkRequest(oldpath, newpath))
+    return st, nothing
+end
+
+"""
+    readlink(fs::FileSystem, path::String)
+
+Read a symbolic link's target (vendor extension). Returns
+`(status, String | nothing)`.
+"""
+function readlink(fs::FileSystem, path::String)
+    st, body = perform(fs, Wire.ReadlinkRequest(path))
+    isOK(st) || return st, nothing
+    return st, rstrip(String(copy(body)), '\0')
+end

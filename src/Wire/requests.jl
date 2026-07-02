@@ -609,3 +609,204 @@ function body!(frame::Vector{UInt8}, r::SigverRequest)
 end
 
 payload(r::SigverRequest) = r.hmac
+
+# ---- extended filesystem operations ----
+
+"""
+    FattrRequest(subcode, path; names=String[], values=Vector{UInt8}[],
+                 options=0x00, fhandle=(0,0,0,0))
+
+`kXR_fattr` — extended-attribute operations. `subcode` is `kXR_fattrGet` /
+`Set` / `Del` / `List`. Path-based payload is `"<path>\\0"` followed by the
+nvec (`[int16 rc=0][name\\0]` per name) and, for Set, the vvec
+(`[int32 BE vlen][value]` per value). Layouts: libxrdc `fattr.c`.
+"""
+struct FattrRequest <: Request
+    subcode::UInt8
+    path::String
+    names::Vector{String}
+    values::Vector{Vector{UInt8}}
+    options::UInt8
+    fhandle::NTuple{4,UInt8}
+end
+
+function FattrRequest(
+    subcode::UInt8,
+    path::AbstractString;
+    names::Vector{<:AbstractString}=String[],
+    values::Vector{<:AbstractVector{UInt8}}=Vector{UInt8}[],
+    options::UInt8=0x00,
+    fhandle::NTuple{4,UInt8}=(0x00, 0x00, 0x00, 0x00),
+)
+    return FattrRequest(
+        subcode, String(path), String.(names), Vector{UInt8}.(values), options, fhandle
+    )
+end
+
+requestid(::FattrRequest) = kXR_fattr
+
+function body!(frame::Vector{UInt8}, r::FattrRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    frame[9] = r.subcode
+    frame[10] = UInt8(length(r.names))
+    frame[11] = r.options
+    return frame
+end
+
+function payload(r::FattrRequest)
+    io = IOBuffer()
+    write(io, codeunits(r.path))
+    write(io, 0x00)                       # path NUL terminator
+    for name in r.names
+        write(io, 0x00, 0x00)             # int16 rc = 0
+        write(io, codeunits(name))
+        write(io, 0x00)                   # name NUL terminator
+    end
+    if r.subcode == kXR_fattrSet
+        for val in r.values
+            len = zeros(UInt8, 4)
+            set_u32!(len, 1, UInt32(length(val)))
+            write(io, len)
+            write(io, val)
+        end
+    end
+    return take!(io)
+end
+
+"""
+    SetattrRequest(path; flags, atime=(0,0), mtime=(0,0), uid=-1, gid=-1)
+
+`kXR_setattr` (vendor ext) — set timestamps and/or owner. 44-byte
+big-endian prefix (flags, atime s/ns, mtime s/ns, uid, gid) then the
+NUL-terminated path.
+"""
+struct SetattrRequest <: Request
+    path::String
+    flags::Int32
+    atime_s::Int64
+    atime_ns::Int64
+    mtime_s::Int64
+    mtime_ns::Int64
+    uid::Int32
+    gid::Int32
+end
+
+function SetattrRequest(
+    path::AbstractString;
+    flags::Integer,
+    atime::Tuple{Integer,Integer}=(0, 0),
+    mtime::Tuple{Integer,Integer}=(0, 0),
+    uid::Integer=-1,
+    gid::Integer=-1,
+)
+    return SetattrRequest(
+        String(path),
+        Int32(flags),
+        Int64(atime[1]),
+        Int64(atime[2]),
+        Int64(mtime[1]),
+        Int64(mtime[2]),
+        Int32(uid),
+        Int32(gid),
+    )
+end
+
+requestid(::SetattrRequest) = kXR_setattr
+
+function payload(r::SetattrRequest)
+    p = zeros(UInt8, SETATTR_PREFIX_LEN)
+    set_u32!(p, 1, reinterpret(UInt32, r.flags))
+    set_u64!(p, 5, reinterpret(UInt64, r.atime_s))
+    set_u64!(p, 13, reinterpret(UInt64, r.atime_ns))
+    set_u64!(p, 21, reinterpret(UInt64, r.mtime_s))
+    set_u64!(p, 29, reinterpret(UInt64, r.mtime_ns))
+    set_u32!(p, 37, reinterpret(UInt32, r.uid))
+    set_u32!(p, 41, reinterpret(UInt32, r.gid))
+    return vcat(p, Vector{UInt8}(codeunits(r.path)), UInt8[0x00])
+end
+
+"""
+    SymlinkRequest(target, link)
+
+`kXR_symlink` (vendor ext) — create `link` pointing at `target`. Payload
+`target * " " * link`, `arg1len = ncodeunits(target)`.
+"""
+struct SymlinkRequest <: Request
+    target::String
+    link::String
+end
+
+SymlinkRequest(t::AbstractString, l::AbstractString) = SymlinkRequest(String(t), String(l))
+requestid(::SymlinkRequest) = kXR_symlink
+function body!(frame::Vector{UInt8}, r::SymlinkRequest)
+    return (set_u16!(frame, 19, UInt16(ncodeunits(r.target))); frame)
+end
+payload(r::SymlinkRequest) = codeunits(r.target * " " * r.link)
+
+"""
+    LinkRequest(oldpath, newpath)
+
+`kXR_link` (vendor ext) — hard-link `newpath` to `oldpath`. Payload
+`old * " " * new`, `arg1len = ncodeunits(old)`.
+"""
+struct LinkRequest <: Request
+    oldpath::String
+    newpath::String
+end
+
+LinkRequest(o::AbstractString, n::AbstractString) = LinkRequest(String(o), String(n))
+requestid(::LinkRequest) = kXR_link
+function body!(frame::Vector{UInt8}, r::LinkRequest)
+    return (set_u16!(frame, 19, UInt16(ncodeunits(r.oldpath))); frame)
+end
+payload(r::LinkRequest) = codeunits(r.oldpath * " " * r.newpath)
+
+"""
+    ReadlinkRequest(path)
+
+`kXR_readlink` (vendor ext) — read a symlink's target. Response body is the
+target string (dlen bytes).
+"""
+struct ReadlinkRequest <: Request
+    path::String
+end
+
+ReadlinkRequest(p::AbstractString) = ReadlinkRequest(String(p))
+requestid(::ReadlinkRequest) = kXR_readlink
+payload(r::ReadlinkRequest) = codeunits(r.path)
+
+"""
+    PrepareRequest(paths; options=kXR_stage, prty=0, port=0, optionX=0)
+
+`kXR_prepare` — stage/evict/cancel one or more paths. Payload is the
+newline-separated path list.
+"""
+struct PrepareRequest <: Request
+    paths::Vector{String}
+    options::UInt8
+    prty::UInt8
+    port::UInt16
+    optionX::UInt16
+end
+
+function PrepareRequest(
+    paths::Vector{<:AbstractString};
+    options::UInt8=kXR_stage,
+    prty::UInt8=0x00,
+    port::UInt16=0x0000,
+    optionX::UInt16=0x0000,
+)
+    return PrepareRequest(String.(paths), options, prty, port, optionX)
+end
+
+requestid(::PrepareRequest) = kXR_prepare
+
+function body!(frame::Vector{UInt8}, r::PrepareRequest)
+    frame[5] = r.options
+    frame[6] = r.prty
+    set_u16!(frame, 7, r.port)
+    set_u16!(frame, 9, r.optionX)
+    return frame
+end
+
+payload(r::PrepareRequest) = codeunits(join(r.paths, "\n"))

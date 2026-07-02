@@ -243,3 +243,71 @@ using CRC32c: crc32c
         @test crc == crc32c(UInt8[0xde, 0xad])
     end
 end
+
+using XRootD.Wire:
+    FattrRequest,
+    SetattrRequest,
+    SymlinkRequest,
+    LinkRequest,
+    ReadlinkRequest,
+    PrepareRequest,
+    kXR_fattrGet,
+    kXR_fattrSet,
+    kXR_fattrList,
+    kXR_stage
+
+@testset "Wire extended operation requests" begin
+    @testset "fattr get/set/list" begin
+        g = encode(FattrRequest(kXR_fattrGet, "/f"; names=["user.x"]), UInt16(1))
+        @test g[3:4] == UInt8[0x0b, 0xcc]        # kXR_fattr (3020)
+        @test g[9] == kXR_fattrGet
+        @test g[10] == 0x01                      # numattr
+        @test String(g[25:27]) == "/f\0"         # path + NUL
+        @test g[28:29] == UInt8[0x00, 0x00]      # nvec rc
+        @test String(g[30:36]) == "user.x\0"
+
+        s = encode(
+            FattrRequest(kXR_fattrSet, "/f"; names=["a"], values=[UInt8[0x01, 0x02]]),
+            UInt16(1),
+        )
+        @test s[9] == kXR_fattrSet
+        # after "/f\0" + rc(2) + "a\0" comes vvec [int32 len][value]
+        tail = s[25:end]
+        i = findfirst(==(0x00), tail) + 1        # after path NUL
+        @test tail[(i + 2):(i + 3)] == codeunits("a\0")[1:2]
+
+        l = encode(FattrRequest(kXR_fattrList, "/f"), UInt16(1))
+        @test l[9] == kXR_fattrList
+        @test l[10] == 0x00
+    end
+
+    @testset "setattr prefix" begin
+        f = encode(SetattrRequest("/f"; flags=1, mtime=(1700000000, 0)), UInt16(2))
+        @test f[3:4] == UInt8[0x0d, 0xac]        # kXR_setattr (3500)
+        @test Wire.get_u32(f, 25) == 1           # flags at payload start
+        @test Wire.get_u64(f, 25 + 20) == 1700000000  # mtime_s at prefix off 20
+        @test String(f[(25 + 44):end]) == "/f\0"
+    end
+
+    @testset "symlink / link / readlink" begin
+        sl = encode(SymlinkRequest("/target", "/link"), UInt16(3))
+        @test sl[3:4] == UInt8[0x0d, 0xad]       # kXR_symlink (3501)
+        @test Wire.get_u16(sl, 19) == ncodeunits("/target")
+        @test String(sl[25:end]) == "/target /link"
+
+        ln = encode(LinkRequest("/old", "/new"), UInt16(3))
+        @test ln[3:4] == UInt8[0x0d, 0xaf]       # kXR_link (3503)
+        @test Wire.get_u16(ln, 19) == ncodeunits("/old")
+
+        rl = encode(ReadlinkRequest("/link"), UInt16(3))
+        @test rl[3:4] == UInt8[0x0d, 0xae]       # kXR_readlink (3502)
+        @test String(rl[25:end]) == "/link"
+    end
+
+    @testset "prepare" begin
+        p = encode(PrepareRequest(["/a", "/b"]; options=kXR_stage), UInt16(4))
+        @test p[3:4] == UInt8[0x0b, 0xcd]        # kXR_prepare (3021)
+        @test p[5] == kXR_stage
+        @test String(p[25:end]) == "/a\n/b"
+    end
+end
