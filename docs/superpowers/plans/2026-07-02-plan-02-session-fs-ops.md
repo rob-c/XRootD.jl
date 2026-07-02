@@ -103,7 +103,7 @@ test/Project.toml       + XRootD_jll
   has_ext::Bool)` (empty/zero when absent).
 
 **Steps** (same TDD cycle as plan 01 tasks 5–7):
-- [ ] Append golden-frame tests to `test/wire/test_requests.jl` for every
+- [x] Append golden-frame tests to `test/wire/test_requests.jl` for every
   request above (compute opcode hex from the DECIMAL constants:
   mkdir 3008=0x0bc0, mv 3009=0x0bc1, open 3010=0x0bc2, chmod 3002=0x0bba,
   rm 3014=0x0bc6, rmdir 3015=0x0bc7, truncate 3028=0x0bd4,
@@ -111,7 +111,7 @@ test/Project.toml       + XRootD_jll
   write 3019=0x0bcb, close 3003=0x0bbb, sync 3016=0x0bc8) and decoder tests
   to `test/wire/test_responses.jl` (locate tokens, extended stat line,
   open body with/without stat).
-- [ ] Run: expect UndefVarError. Implement in `src/Wire/{constants,requests,
+- [x] Run: expect UndefVarError. Implement in `src/Wire/{constants,requests,
   responses}.jl`. Run: PASS. Format, commit
   `feat(wire): fs and file operation codecs`.
 
@@ -147,7 +147,7 @@ test/Project.toml       + XRootD_jll
   error for now (plan 05 adds following).
 
 **Steps:**
-- [ ] Write `test/session/test_connection.jl` with an in-process mock server
+- [x] Write `test/session/test_connection.jl` with an in-process mock server
   (Sockets listener Task that reads the 44-byte bring-up, replies with
   canned handshake/protocol/login frames, then answers one `PingRequest`
   with kXR_ok, one `DirlistRequest` with a 2-chunk kXR_oksofar + kXR_ok
@@ -155,7 +155,7 @@ test/Project.toml       + XRootD_jll
   `RmRequest` with kXR_error 3011). Assert bring-up state (protover,
   sessid), oksofar accumulation, wait retry, error passthrough, and that
   `close` fails pending requests.
-- [ ] Run: fails (module missing). Implement `src/Session/`. Run: PASS.
+- [x] Run: fails (module missing). Implement `src/Session/`. Run: PASS.
   Format, commit `feat(session): connection bring-up and multiplexed roundtrip`.
 
 ---
@@ -188,11 +188,11 @@ test/Project.toml       + XRootD_jll
   MakePath=1). All UInt16 consts so `|` composes.
 
 **Steps:**
-- [ ] Write `test/client/test_types.jl`: status show/isOK; StatInfo from
+- [x] Write `test/client/test_types.jl`: status show/isOK; StatInfo from
   basic + extended lines incl. octmode derivation (`"0775"` →
   `"rwxrwxr-x"`), isdir/isfile/isreadable/isExecutable; enum spot values;
   Location/ProtocolInfo show smoke.
-- [ ] Run: fails. Implement `src/Client/{status,responses,enums}.jl` +
+- [x] Run: fails. Implement `src/Client/{status,responses,enums}.jl` +
   module `XrdCl` skeleton wired into `src/XRootD.jl`. Run: PASS. Format,
   commit `feat(client): XrdCl status/statinfo/enum types`.
 
@@ -224,10 +224,10 @@ test/Project.toml       + XRootD_jll
   round trip per directory).
 
 **Steps:**
-- [ ] Extend the Task-2 mock server tests with a FileSystem-level test:
+- [x] Extend the Task-2 mock server tests with a FileSystem-level test:
   `FileSystem` against the mock, `ping` + `stat` + error mapping
   (kXR_error 3011 → `!isOK(st)` with message).
-- [ ] Run: fails. Implement `src/Client/filesystem.jl`. Run: PASS. Format,
+- [x] Run: fails. Implement `src/Client/filesystem.jl`. Run: PASS. Format,
   commit `feat(client): FileSystem operations`.
 
 ---
@@ -235,18 +235,18 @@ test/Project.toml       + XRootD_jll
 ### Task 5: Integration — legacy testFileSystem.jl against a real server
 
 **Steps:**
-- [ ] Add `XRootD_jll` (uuid `cf5b7e95-2b45-53a5-8b71-ac0ecf6bbaa9`? — take
+- [x] Add `XRootD_jll` (uuid `cf5b7e95-2b45-53a5-8b71-ac0ecf6bbaa9`? — take
   the uuid from the registry at execution time, do not trust this line) to
   `test/Project.toml`.
-- [ ] Extend `test/runtests.jl`: after unit testsets, when
+- [x] Extend `test/runtests.jl`: after unit testsets, when
   `XRootD_jll.is_available()`, start `xrootd` (serving default `/tmp`) as
   in the 0.2.x runtests (`run(ignorestatus(...); wait=false)` + readiness
   wait loop on TCP connect to 1094), `include("legacy/testFileSystem.jl")`,
   kill server in `finally`.
-- [ ] Run the full suite. Fix empirically whatever the real server exposes
+- [x] Run the full suite. Fix empirically whatever the real server exposes
   differently (extended stat availability, login sec trailer, locate token
   shapes). The legacy file itself is NOT modified.
-- [ ] Full `Pkg.test()` green. Format, commit
+- [x] Full `Pkg.test()` green. Format, commit
   `feat(client): legacy FileSystem parity against real xrootd`.
 
 ## Completion gate
