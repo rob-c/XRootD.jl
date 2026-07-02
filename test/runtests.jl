@@ -39,6 +39,7 @@ end
                 include("legacy/testFileSystem.jl")
                 include("legacy/testFile.jl")
                 include("integration/test_file_v5.jl")
+                include("integration/test_tls.jl")
             finally
                 kill(xrootd_server)
             end

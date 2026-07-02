@@ -11,7 +11,7 @@ parses response frames off the socket and routes each to the Channel in
 `pending` keyed by its streamid; operations run through [`roundtrip`](@ref).
 """
 mutable struct Connection
-    sock::TCPSocket
+    sock::IO                        # TCPSocket, or an OpenSSL.SSLStream after upgrade
     host::String
     port::Int
     username::String
@@ -27,33 +27,53 @@ mutable struct Connection
 end
 
 """
-    connect(host, port; username = ENV["USER"], want_tls = false) -> Connection
+    connect(host, port; username = ENV["USER"], want_tls = false,
+            insecure_tls = false) -> Connection
 
 Establish a session: TCP connect, then the 44-byte pipelined bring-up
 segment (20-byte handshake + `kXR_protocol`, exactly as libxrdc `conn.c`
-sends it), then `kXR_login`. If the login reply's security trailer requests
-authentication and offers `unix`, one `kXR_auth` round with the
-`"unix\\0" * username` credential completes it (libxrdc `sec/sec_unix.c`).
+sends it); when the client requires TLS (`want_tls`, i.e. `roots://`) or
+the server demands it (`kXR_gotoTLS`/`kXR_tlsLogin` in the protocol reply),
+the socket upgrades to TLS before `kXR_login` (libxrdc `tls.c`). The login
+reply's security trailer then drives authentication
+([`authenticate`](@ref)).
 
-TLS (`want_tls`) is not implemented until plan 04.
+`insecure_tls` skips certificate-chain verification (test servers with
+self-signed certificates only — never for production data).
 """
 function connect(
     host::AbstractString,
     port::Integer;
     username::AbstractString=get(ENV, "USER", "nobody"),
     want_tls::Bool=false,
+    insecure_tls::Bool=false,
 )
-    want_tls && throw(ArgumentError("TLS support arrives in plan 04 (roots://)"))
-    sock = Sockets.connect(String(host), port)
+    sock::IO = Sockets.connect(String(host), port)
 
     # Bring-up is synchronous: the reader Task starts only once the session
     # is authenticated, so plain blocking reads are safe here.
-    write(sock, vcat(Wire.HANDSHAKE, Wire.encode(Wire.ProtocolRequest(), UInt16(1))))
+    flags = if want_tls
+        (Wire.kXR_secreqs | Wire.kXR_ableTLS | Wire.kXR_wantTLS)
+    else
+        (Wire.kXR_secreqs | Wire.kXR_ableTLS)
+    end
+    write(sock, vcat(Wire.HANDSHAKE, Wire.encode(Wire.ProtocolRequest(; flags), UInt16(1))))
     hs_hdr, _ = read_frame(sock)
     hs_hdr.status == Wire.kXR_ok || bringup_error("handshake", hs_hdr)
     p_hdr, p_body = read_frame(sock)
     p_hdr.status == Wire.kXR_ok || bringup_error("kXR_protocol", p_hdr)
     proto = Wire.decode_protocol(p_body)
+
+    server_demands = (proto.flags & (Wire.kXR_gotoTLS | Wire.kXR_tlsLogin)) != 0
+    if want_tls || server_demands
+        if (proto.flags & Wire.kXR_haveTLS) == 0
+            error(
+                "TLS required but the server at $host:$port does not offer it " *
+                "(protocol flags 0x$(string(proto.flags; base=16)))",
+            )
+        end
+        sock = tls_upgrade(sock, String(host); insecure_tls)
+    end
 
     write(sock, Wire.encode(Wire.LoginRequest(username), UInt16(2)))
     l_hdr, l_body = read_frame(sock)
@@ -86,26 +106,51 @@ end
 """
     connect(url::AbstractString; kwargs...) -> Connection
 
-Convenience: parse `root://host[:port]` (default port 1094) and connect.
+Convenience: parse `root://host[:port]` (default port 1094) and connect;
+a `roots://` scheme forces TLS.
 """
 function connect(url::AbstractString; kwargs...)
-    m = match(r"^root://([^/:@]+)(?::(\d+))?", url)
+    m = match(r"^(roots?)://([^/:@]+)(?::(\d+))?", url)
     m === nothing && throw(ArgumentError("not a root:// URL: $(repr(url))"))
-    host = String(something(m.captures[1]))
-    portstr = m.captures[2]
+    scheme = String(something(m.captures[1]))
+    host = String(something(m.captures[2]))
+    portstr = m.captures[3]
     port = portstr === nothing ? 1094 : parse(Int, portstr)
-    return connect(host, port; kwargs...)
+    return connect(host, port; want_tls=(scheme == "roots"), kwargs...)
 end
 
 function bringup_error(stage::String, hdr::Wire.ResponseHeader)
     return error("$stage failed with status $(hdr.status)")
 end
 
+"""
+Read exactly `n` bytes (blocking; `EOFError` on a short read). Uses
+`unsafe_read`, the one input primitive both `TCPSocket` and
+`OpenSSL.SSLStream` implement natively.
+"""
+function readn(sock::IO, n::Int)
+    buf = Vector{UInt8}(undef, n)
+    n == 0 && return buf
+    GC.@preserve buf unsafe_read(sock, pointer(buf), UInt(n))
+    return buf
+end
+
 "Read one complete response frame (blocking)."
-function read_frame(sock::TCPSocket)
-    hdr = Wire.decode_header(read(sock, Wire.RESPONSE_HDRLEN))
-    body = hdr.dlen > 0 ? read(sock, Int(hdr.dlen)) : UInt8[]
+function read_frame(sock::IO)
+    hdr = Wire.decode_header(readn(sock, Wire.RESPONSE_HDRLEN))
+    body = hdr.dlen > 0 ? readn(sock, Int(hdr.dlen)) : UInt8[]
     return hdr, body
+end
+
+"""
+Upgrade a live socket to TLS (client mode) with SNI/hostname checking.
+Chain verification is on unless `insecure_tls` (self-signed test servers).
+"""
+function tls_upgrade(sock::IO, host::String; insecure_tls::Bool=false)
+    ssl = OpenSSL.SSLStream(sock)
+    OpenSSL.hostname!(ssl, host)
+    OpenSSL.connect(ssl; require_ssl_verification=(!insecure_tls))
+    return ssl
 end
 
 """
@@ -113,7 +158,7 @@ One `kXR_auth` round for the `unix` protocol: credtype `"unix"`, payload
 `"unix\\0" * username`. The server either accepts (`kXR_ok`) or the
 mechanism is unavailable — multi-round mechanisms (ztn, sss) are plan 04.
 """
-function authenticate(sock::TCPSocket, username::AbstractString, sec::String)
+function authenticate(sock::IO, username::AbstractString, sec::String)
     occursin("unix", sec) || error(
         "server requires authentication ($(sec)); only unix is supported until plan 04"
     )
@@ -140,7 +185,7 @@ function reader_loop(conn::Connection)
                 # status body announces pgdlen trailing bytes (ops_file_pg.c).
                 if length(body) >= Wire.STATUS_BODY_LEN
                     pgdlen = Wire.get_u32(body, 13)
-                    pgdlen > 0 && append!(body, read(conn.sock, Int(pgdlen)))
+                    pgdlen > 0 && append!(body, readn(conn.sock, Int(pgdlen)))
                 end
                 deliver(conn, hdr, body)
             else

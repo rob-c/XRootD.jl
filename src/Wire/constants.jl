@@ -62,6 +62,11 @@ const kXR_status    = UInt16(4007)
 const kXR_asyncms   = UInt32(5002)
 const kXR_asynresp  = UInt32(5008)
 
+# ---- kXR_protocol response flags (server type + TLS negotiation) ----
+const kXR_haveTLS  = UInt32(0x80000000)  # server accepts in-protocol TLS upgrade
+const kXR_gotoTLS  = UInt32(0x40000000)  # client must upgrade immediately
+const kXR_tlsLogin = UInt32(0x04000000)  # the login exchange requires TLS
+
 # ---- handshake / kXR_protocol ----
 const ROOTD_PQ             = UInt32(2012)        # 5th word of the client hello
 const kXR_PROTOCOLVERSION  = UInt32(0x00000520)  # protocol 5.2.0

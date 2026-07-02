@@ -4,33 +4,40 @@
 # per-request timeouts arrive with the resilience work (plan 05).
 
 """
-    FileSystem(url::String)
+    FileSystem(url::String; insecure_tls::Bool=false)
 
 Handle for filesystem operations against an XRootD server, e.g.
-`FileSystem("root://localhost:1094")`. Connects lazily on first use and
-reconnects if the connection is lost.
+`FileSystem("root://localhost:1094")`. A `roots://` URL upgrades the
+connection to TLS. Connects lazily on first use and reconnects if the
+connection is lost. `insecure_tls` skips certificate-chain verification
+(self-signed test servers only).
 """
 mutable struct FileSystem
     url::String
     host::String
     port::Int
+    want_tls::Bool
+    insecure_tls::Bool
     conn::Union{Session.Connection,Nothing}
 end
 
-function FileSystem(url::String, isServer::Bool=false)
-    m = match(r"^roots?://([^/:@]+)(?::(\d+))?", url)
+function FileSystem(url::String, isServer::Bool=false; insecure_tls::Bool=false)
+    m = match(r"^(roots?)://([^/:@]+)(?::(\d+))?", url)
     m === nothing && throw(ArgumentError("not a root:// URL: $(repr(url))"))
-    host = String(something(m.captures[1]))
-    portstr = m.captures[2]
+    scheme = String(something(m.captures[1]))
+    host = String(something(m.captures[2]))
+    portstr = m.captures[3]
     port = portstr === nothing ? 1094 : parse(Int, portstr)
-    return FileSystem(url, host, port, nothing)
+    return FileSystem(url, host, port, scheme == "roots", insecure_tls, nothing)
 end
 
 "Connect lazily; reconnect when the previous connection died."
 function connection!(fs::FileSystem)
     conn = fs.conn
     if conn === nothing || !isopen(conn)
-        conn = Session.connect(fs.host, fs.port)
+        conn = Session.connect(
+            fs.host, fs.port; want_tls=fs.want_tls, insecure_tls=fs.insecure_tls
+        )
         fs.conn = conn
     end
     return conn

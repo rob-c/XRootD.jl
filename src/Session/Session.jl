@@ -14,6 +14,7 @@ design — Julia Tasks/Channels replace the epoll loop).
 module Session
 
 using Sockets: Sockets, TCPSocket
+using OpenSSL: OpenSSL
 using ..Wire
 
 include("connection.jl")
