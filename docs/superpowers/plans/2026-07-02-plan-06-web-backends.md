@@ -38,7 +38,7 @@ Plans 01–05 constraints, plus (ground truth: libxrdc `url.c`, `webfile.c`,
 ## Tasks
 
 ### Task 1: URL parsing + Storage interface
-- [ ] `Backend` scheme detection and `parse_url(url)` (scheme, host, port,
+- [x] `Backend` scheme detection and `parse_url(url)` (scheme, host, port,
   path, tls); the abstract `Storage` interface with the five verbs and a
   `storage_for(url; kwargs...)` factory. Local + XRootD backends
   (XRootD delegates to FileSystem/File). Unit tests for parsing + local
@@ -46,13 +46,13 @@ Plans 01–05 constraints, plus (ground truth: libxrdc `url.c`, `webfile.c`,
   Commit `feat(storage): url parsing, interface, local + xrootd backends`.
 
 ### Task 2: HTTP / WebDAV backend
-- [ ] `WebStorage` on HTTP.jl: GET-with-range read, PUT write, HEAD stat,
+- [x] `WebStorage` on HTTP.jl: GET-with-range read, PUT write, HEAD stat,
   PROPFIND list. Tests against an in-process HTTP.jl server serving a temp
   dir (GET/HEAD/PUT round trip; a canned PROPFIND multistatus body parsed).
   Commit `feat(storage): http/webdav backend`.
 
 ### Task 3: S3 backend + SigV4
-- [ ] `sigv4_sign(...)` validated against the AWS example vectors; `S3Storage`
+- [x] `sigv4_sign(...)` validated against the AWS example vectors; `S3Storage`
   (GET/PUT/HEAD/GET-bucket-list, path- and virtual-host style). Signer unit
   tests + an in-process mock S3 (HTTP.jl server asserting the Authorization
   header shape) round trip. Commit `feat(storage): s3 backend with sigv4`.

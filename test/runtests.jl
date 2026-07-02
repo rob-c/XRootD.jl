@@ -31,6 +31,7 @@ end
     include("session/test_resilience.jl")
     include("client/test_types.jl")
     include("client/test_file.jl")
+    include("storage/test_storage.jl")
     include("test_quality.jl")
 
     if XRootD_jll.is_available()
