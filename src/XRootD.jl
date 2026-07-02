@@ -23,5 +23,6 @@ module XRootD
 
 include("Wire/Wire.jl")
 include("Session/Session.jl")
+include("Client/XrdCl.jl")
 
 end # module XRootD

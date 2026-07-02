@@ -91,8 +91,10 @@ Convenience: parse `root://host[:port]` (default port 1094) and connect.
 function connect(url::AbstractString; kwargs...)
     m = match(r"^root://([^/:@]+)(?::(\d+))?", url)
     m === nothing && throw(ArgumentError("not a root:// URL: $(repr(url))"))
-    port = m.captures[2] === nothing ? 1094 : parse(Int, m.captures[2])
-    return connect(m.captures[1], port; kwargs...)
+    host = String(something(m.captures[1]))
+    portstr = m.captures[2]
+    port = portstr === nothing ? 1094 : parse(Int, portstr)
+    return connect(host, port; kwargs...)
 end
 
 function bringup_error(stage::String, hdr::Wire.ResponseHeader)
