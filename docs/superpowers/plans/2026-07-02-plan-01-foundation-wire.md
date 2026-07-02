@@ -57,7 +57,7 @@ config, and a green (smoke-only) test suite.
   `Pkg.test()` green; later tasks append `include(...)` lines to
   `src/Wire/Wire.jl` and `test/runtests.jl`.
 
-- [ ] **Step 1: Remove the CxxWrap machinery and move legacy tests**
+- [x] **Step 1: Remove the CxxWrap machinery and move legacy tests**
 
 ```bash
 cd /home/rcurrie/HEP-x/XRootD.jl
@@ -68,7 +68,7 @@ git mv test/testFile.jl test/legacy/testFile.jl
 git mv test/testFileSystem.jl test/legacy/testFileSystem.jl
 ```
 
-- [ ] **Step 2: Replace `Project.toml`**
+- [x] **Step 2: Replace `Project.toml`**
 
 ```toml
 name = "XRootD"
@@ -90,7 +90,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 test = ["Aqua", "JET", "Test"]
 ```
 
-- [ ] **Step 3: Replace `src/XRootD.jl`**
+- [x] **Step 3: Replace `src/XRootD.jl`**
 
 ```julia
 """
@@ -121,7 +121,7 @@ include("Wire/Wire.jl")
 end # module XRootD
 ```
 
-- [ ] **Step 4: Create `src/Wire/Wire.jl`**
+- [x] **Step 4: Create `src/Wire/Wire.jl`**
 
 ```julia
 """
@@ -142,13 +142,13 @@ module Wire
 end # module Wire
 ```
 
-- [ ] **Step 5: Create `.JuliaFormatter.toml`**
+- [x] **Step 5: Create `.JuliaFormatter.toml`**
 
 ```toml
 style = "blue"
 ```
 
-- [ ] **Step 6: Replace `test/runtests.jl`**
+- [x] **Step 6: Replace `test/runtests.jl`**
 
 ```julia
 using Test
@@ -161,12 +161,12 @@ using XRootD
 end
 ```
 
-- [ ] **Step 7: Run the test suite**
+- [x] **Step 7: Run the test suite**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS (1 test).
 
-- [ ] **Step 8: Format and commit**
+- [x] **Step 8: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -194,7 +194,7 @@ git commit -m "refactor!: remove CxxWrap binding, start pure-Julia 0.3 skeleton"
   `get_bounded_string(buf, off, maxlen)::String`.
   All offsets are 1-based. Setters return `buf`; all are bounds-checked.
 
-- [ ] **Step 1: Write the failing test — `test/wire/test_primitives.jl`**
+- [x] **Step 1: Write the failing test — `test/wire/test_primitives.jl`**
 
 ```julia
 using XRootD.Wire:
@@ -243,13 +243,13 @@ using XRootD.Wire:
 end
 ```
 
-- [ ] **Step 2: Add `include("wire/test_primitives.jl")` inside the top
+- [x] **Step 2: Add `include("wire/test_primitives.jl")` inside the top
   testset in `test/runtests.jl`, then run to verify it fails**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL — `UndefVarError` (`get_u16` not defined in `XRootD.Wire`).
 
-- [ ] **Step 3: Write `src/Wire/primitives.jl`**
+- [x] **Step 3: Write `src/Wire/primitives.jl`**
 
 ```julia
 # Big-endian accessors over byte buffers. The XRootD wire is big-endian
@@ -386,13 +386,13 @@ function get_bounded_string(buf::AbstractVector{UInt8}, off::Integer, maxlen::In
 end
 ```
 
-- [ ] **Step 4: Add `include("primitives.jl")` inside `module Wire` in
+- [x] **Step 4: Add `include("primitives.jl")` inside `module Wire` in
   `src/Wire/Wire.jl`, run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -416,7 +416,7 @@ git commit -m "feat(wire): big-endian byte primitives"
   `request_name(id::Integer)::String`. Exact names and types below — later
   tasks and plans use them verbatim.
 
-- [ ] **Step 1: Write the failing test — `test/wire/test_constants.jl`**
+- [x] **Step 1: Write the failing test — `test/wire/test_constants.jl`**
 
 ```julia
 using XRootD.Wire:
@@ -461,12 +461,12 @@ using XRootD.Wire:
 end
 ```
 
-- [ ] **Step 2: Add the runtests include, run to verify it fails**
+- [x] **Step 2: Add the runtests include, run to verify it fails**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL with `UndefVarError: kXR_auth`.
 
-- [ ] **Step 3: Write `src/Wire/constants.jl`**
+- [x] **Step 3: Write `src/Wire/constants.jl`**
 
 ```julia
 # XRootD protocol constants. Names are kept verbatim from the protocol
@@ -609,12 +609,12 @@ function request_name(id::Integer)
 end
 ```
 
-- [ ] **Step 4: Add the Wire.jl include, run tests to verify they pass**
+- [x] **Step 4: Add the Wire.jl include, run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -647,7 +647,7 @@ git commit -m "feat(wire): kXR protocol constants"
   Plan 02's Session writes `encode(...)` output to the socket and feeds the
   first 8 read bytes to `decode_header`.
 
-- [ ] **Step 1: Write the failing test — `test/wire/test_frames.jl`**
+- [x] **Step 1: Write the failing test — `test/wire/test_frames.jl`**
 
 ```julia
 using XRootD.Wire
@@ -698,12 +698,12 @@ Wire.payload(::FakePayloadRequest) = codeunits("/tmp")
 end
 ```
 
-- [ ] **Step 2: Add the runtests include, run to verify it fails**
+- [x] **Step 2: Add the runtests include, run to verify it fails**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL with `UndefVarError: HANDSHAKE`.
 
-- [ ] **Step 3: Write `src/Wire/frames.jl`**
+- [x] **Step 3: Write `src/Wire/frames.jl`**
 
 ```julia
 # Frame-level codecs: the 20-byte client hello, the 24-byte ClientRequestHdr,
@@ -813,12 +813,12 @@ function decode_header(bytes::AbstractVector{UInt8})
 end
 ```
 
-- [ ] **Step 4: Add the Wire.jl include, run tests to verify they pass**
+- [x] **Step 4: Add the Wire.jl include, run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -845,7 +845,7 @@ git commit -m "feat(wire): handshake and request/response frame codecs"
   - `AuthRequest(credtype::String, cred::Vector{UInt8})`
   - `PingRequest()`
 
-- [ ] **Step 1: Write the failing test — `test/wire/test_requests.jl`**
+- [x] **Step 1: Write the failing test — `test/wire/test_requests.jl`**
 
 ```julia
 using XRootD.Wire
@@ -897,12 +897,12 @@ using XRootD.Wire: ProtocolRequest, LoginRequest, AuthRequest, PingRequest, enco
 end
 ```
 
-- [ ] **Step 2: Add the runtests include, run to verify it fails**
+- [x] **Step 2: Add the runtests include, run to verify it fails**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL with `UndefVarError: ProtocolRequest`.
 
-- [ ] **Step 3: Write `src/Wire/requests.jl`**
+- [x] **Step 3: Write `src/Wire/requests.jl`**
 
 ```julia
 # Concrete request codecs. Field layouts: nginx-xrootd wire_core_requests.h;
@@ -1005,12 +1005,12 @@ struct PingRequest <: Request end
 requestid(::PingRequest) = kXR_ping
 ```
 
-- [ ] **Step 4: Add the Wire.jl include, run tests to verify they pass**
+- [x] **Step 4: Add the Wire.jl include, run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -1034,7 +1034,7 @@ git commit -m "feat(wire): protocol/login/auth/ping request codecs"
     path for open-file stat;
   - `DirlistRequest(path; options::UInt8 = kXR_dstat)`.
 
-- [ ] **Step 1: Append failing tests to `test/wire/test_requests.jl`**
+- [x] **Step 1: Append failing tests to `test/wire/test_requests.jl`**
 
 ```julia
 using XRootD.Wire: StatRequest, DirlistRequest, kXR_dstat, kXR_vfs
@@ -1072,12 +1072,12 @@ using XRootD.Wire: StatRequest, DirlistRequest, kXR_dstat, kXR_vfs
 end
 ```
 
-- [ ] **Step 2: Run to verify the new testsets fail**
+- [x] **Step 2: Run to verify the new testsets fail**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL with `UndefVarError: StatRequest` (earlier testsets still pass).
 
-- [ ] **Step 3: Append to `src/Wire/requests.jl`**
+- [x] **Step 3: Append to `src/Wire/requests.jl`**
 
 ```julia
 """
@@ -1141,12 +1141,12 @@ end
 payload(r::DirlistRequest) = codeunits(r.path)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -1175,7 +1175,7 @@ git commit -m "feat(wire): stat and dirlist request codecs"
   - `parse_stat_line(line) -> (; id::String, size::Int64, flags::UInt32, mtime::Int64)`
   - `parse_dirlist(body) -> (; entries::Vector{String}, stats::Union{Nothing,Vector})`
 
-- [ ] **Step 1: Write the failing test — `test/wire/test_responses.jl`**
+- [x] **Step 1: Write the failing test — `test/wire/test_responses.jl`**
 
 ```julia
 using XRootD.Wire:
@@ -1251,12 +1251,12 @@ using XRootD.Wire:
 end
 ```
 
-- [ ] **Step 2: Add the runtests include, run to verify it fails**
+- [x] **Step 2: Add the runtests include, run to verify it fails**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: FAIL with `UndefVarError: decode_error`.
 
-- [ ] **Step 3: Write `src/Wire/responses.jl`**
+- [x] **Step 3: Write `src/Wire/responses.jl`**
 
 ```julia
 # Response body decoders (nginx-xrootd frame_hdr.h and the per-request
@@ -1391,12 +1391,12 @@ function parse_dirlist(body::AbstractVector{UInt8})
 end
 ```
 
-- [ ] **Step 4: Add the Wire.jl include, run tests to verify they pass**
+- [x] **Step 4: Add the Wire.jl include, run tests to verify they pass**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 julia -e 'using Pkg; Pkg.activate(; temp=true); Pkg.add("JuliaFormatter"); using JuliaFormatter; format(".")'
@@ -1420,7 +1420,7 @@ git commit -m "feat(wire): response body decoders"
 - Produces: CI that fails on unformatted code, Aqua/JET regressions, or test
   failures; a transitional docs build that stays green.
 
-- [ ] **Step 1: Write `test/test_quality.jl`**
+- [x] **Step 1: Write `test/test_quality.jl`**
 
 ```julia
 using Aqua
@@ -1436,13 +1436,13 @@ using JET
 end
 ```
 
-- [ ] **Step 2: Add `include("test_quality.jl")` to `test/runtests.jl`, run**
+- [x] **Step 2: Add `include("test_quality.jl")` to `test/runtests.jl`, run**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS. If Aqua or JET report real findings (ambiguities, unstable
 public calls), fix the flagged code — do not loosen the test.
 
-- [ ] **Step 3: Replace `.github/workflows/ci.yml`**
+- [x] **Step 3: Replace `.github/workflows/ci.yml`**
 
 ```yaml
 name: CI
@@ -1518,7 +1518,7 @@ jobs:
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
 ```
 
-- [ ] **Step 4: Replace `docs/make.jl`**
+- [x] **Step 4: Replace `docs/make.jl`**
 
 ```julia
 using Documenter
@@ -1536,7 +1536,7 @@ makedocs(;
 deploydocs(; repo = "github.com/JuliaHEP/XRootD.jl.git", push_preview = true)
 ```
 
-- [ ] **Step 5: Replace `docs/src/index.md`**
+- [x] **Step 5: Replace `docs/src/index.md`**
 
 ````markdown
 # XRootD.jl
@@ -1574,13 +1574,13 @@ Modules = [XRootD, XRootD.Wire]
 ```
 ````
 
-- [ ] **Step 6: Verify the docs build locally**
+- [x] **Step 6: Verify the docs build locally**
 
 Run: `julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()' && julia --project=docs docs/make.jl`
 Expected: build completes (warnings allowed, no errors). `deploydocs` is a
 no-op locally.
 
-- [ ] **Step 7: Full test run, format, commit**
+- [x] **Step 7: Full test run, format, commit**
 
 Run: `julia --project=. -e 'using Pkg; Pkg.test()'`
 Expected: PASS (all wire + quality testsets).
