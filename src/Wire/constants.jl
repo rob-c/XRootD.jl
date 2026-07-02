@@ -120,6 +120,10 @@ const kXR_Qopaqug = UInt16(64)
 # ---- kXR_writev options byte ----
 const kXR_wv_doSync = 0x01   # fsync each touched handle after the write
 
+# ---- kXR_sigver (flags.h) ----
+const kXR_SHA256_sig = 0x01  # HMAC algorithm is HMAC-SHA256
+const kXR_nodata_sig = 0x01  # payload NOT included in the HMAC
+
 # ---- paged I/O (kXR_pgread / kXR_pgwrite; ops_file_pg.c) ----
 const kXR_pgPageSZ      = 4096   # page size; CRC32c per page
 const kXR_pgRetry       = 0x01   # pgwrite reqflags: resend of a corrupt page

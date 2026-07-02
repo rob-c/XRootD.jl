@@ -2,6 +2,7 @@
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 XRootD_jll = "b6113df7-b24e-50c0-846f-35a2e36cb9d5"

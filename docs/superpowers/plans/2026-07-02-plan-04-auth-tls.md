@@ -44,7 +44,7 @@ Plans 01–03 constraints, plus (ground truth libxrdc `tls.c`,
 ## Tasks
 
 ### Task 1: TLS transport (roots://)
-- [ ] Add OpenSSL.jl; `Connection.sock::IO`; `connect(...; want_tls)` sends
+- [x] Add OpenSSL.jl; `Connection.sock::IO`; `connect(...; want_tls)` sends
   `kXR_wantTLS`, checks the protocol-reply TLS flags, wraps the socket in
   an `SSLStream` (client mode, hostname check unless `insecure_tls`), then
   logs in over TLS. `FileSystem`/`File` URLs with `roots://` set
@@ -54,14 +54,14 @@ Plans 01–03 constraints, plus (ground truth libxrdc `tls.c`,
   with a clear error. Commit `feat(session): in-protocol TLS (roots://)`.
 
 ### Task 2: ZTN bearer tokens
-- [ ] `discover_token(; explicit=nothing)::Union{String,Nothing}` with the
+- [x] `discover_token(; explicit=nothing)::Union{String,Nothing}` with the
   ladder above; `authenticate` parses the `&P=` trailer into an ordered
   mechanism list and tries ztn (when a token exists) before sss/unix. Mock
   test: server trailer `&P=ztn` + credtype/payload assertion on the auth
   frame. Commit `feat(session): ztn bearer-token authentication`.
 
 ### Task 3: SSS shared-secret auth
-- [ ] Pure-Julia Blowfish (P/S boxes from π hex digits via BigFloat,
+- [x] Pure-Julia Blowfish (P/S boxes from π hex digits via BigFloat,
   self-test against two published Blowfish ECB vectors) + CFB64 driver;
   keytab parser (format per libxrdc `sss_keytab.c`); credential builder
   byte-identical to `xrootd_sss_build_credential`. Unit tests: Blowfish
@@ -71,7 +71,7 @@ Plans 01–03 constraints, plus (ground truth libxrdc `tls.c`,
   Commit `feat(session): sss shared-secret authentication`.
 
 ### Task 4: kXR_sigver signing
-- [ ] `SigverRequest` codec (body: expectrid u16, version u8, flags u8,
+- [x] `SigverRequest` codec (body: expectrid u16, version u8, flags u8,
   seqno u64, crypto u8 = kXR_SHA256_sig, rsvd; dlen=32; payload = HMAC);
   `Connection` gains `sec_level`, `signing_key`, `sig_seqno`; `send_signed`
   prefixes the sigver frame when required (opcode policy from the server

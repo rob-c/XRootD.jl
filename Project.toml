@@ -7,11 +7,13 @@ version = "0.3.0-DEV"
 CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
 [compat]
 CRC32c = "1"
 OpenSSL = "1.6.1"
 PrecompileTools = "1.2.1"
+SHA = "0.7"
 Sockets = "1"
 julia = "1.10"

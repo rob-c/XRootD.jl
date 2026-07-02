@@ -15,8 +15,13 @@ module Session
 
 using Sockets: Sockets, TCPSocket
 using OpenSSL: OpenSSL
+using SHA: hmac_sha256
 using ..Wire
 
+include("blowfish.jl")
 include("connection.jl")
+include("sss.jl")
+include("auth.jl")
+include("sigver.jl")
 
 end # module Session

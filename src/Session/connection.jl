@@ -24,6 +24,9 @@ mutable struct Connection
     nextsid::UInt16
     reader::Union{Task,Nothing}
     closed::Bool
+    sec_level::Int                          # server security level (0 = no signing)
+    signing_key::Union{Vector{UInt8},Nothing}
+    sig_seqno::UInt64
 end
 
 """
@@ -47,6 +50,8 @@ function connect(
     username::AbstractString=get(ENV, "USER", "nobody"),
     want_tls::Bool=false,
     insecure_tls::Bool=false,
+    token::Union{AbstractString,Nothing}=nothing,
+    keytab::Union{AbstractString,Nothing}=nothing,
 )
     sock::IO = Sockets.connect(String(host), port)
 
@@ -81,7 +86,7 @@ function connect(
     login = Wire.decode_login(l_body)
 
     if !isempty(login.sec)
-        authenticate(sock, username, login.sec)
+        authenticate(sock, username, login.sec; token, keytab)
     end
 
     conn = Connection(
@@ -98,6 +103,9 @@ function connect(
         UInt16(4),   # 1..3 were used during bring-up
         nothing,
         false,
+        0,           # sec_level: no signing until negotiated
+        nothing,     # signing_key
+        UInt64(0),   # sig_seqno
     )
     conn.reader = errormonitor(Threads.@spawn reader_loop(conn))
     return conn
@@ -153,24 +161,7 @@ function tls_upgrade(sock::IO, host::String; insecure_tls::Bool=false)
     return ssl
 end
 
-"""
-One `kXR_auth` round for the `unix` protocol: credtype `"unix"`, payload
-`"unix\\0" * username`. The server either accepts (`kXR_ok`) or the
-mechanism is unavailable — multi-round mechanisms (ztn, sss) are plan 04.
-"""
-function authenticate(sock::IO, username::AbstractString, sec::String)
-    occursin("unix", sec) || error(
-        "server requires authentication ($(sec)); only unix is supported until plan 04"
-    )
-    cred = vcat(Vector{UInt8}(codeunits("unix\0")), Vector{UInt8}(codeunits(username)))
-    write(sock, Wire.encode(Wire.AuthRequest("unix", cred), UInt16(3)))
-    a_hdr, a_body = read_frame(sock)
-    if a_hdr.status != Wire.kXR_ok
-        msg = a_hdr.status == Wire.kXR_error ? Wire.decode_error(a_body).message : ""
-        error("unix authentication failed (status $(a_hdr.status)): $msg")
-    end
-    return nothing
-end
+# (authentication mechanisms live in auth.jl / sss.jl; signing in sigver.jl)
 
 # ---- reader task ----
 
@@ -283,7 +274,17 @@ function roundtrip(conn::Connection, req::Wire.Request)
     frame = Wire.encode(req, sid)
     acc = UInt8[]
     try
-        send(conn, frame)
+        # High-security servers require a kXR_sigver prefix on mutating ops;
+        # it must share the write lock so it stays adjacent to its request.
+        sig = sign_frame(conn, frame)
+        if sig === nothing
+            send(conn, frame)
+        else
+            lock(conn.wlock) do
+                write(conn.sock, sig)
+                return write(conn.sock, frame)
+            end
+        end
         while true
             hdr, body = take!(ch)
             if hdr.status == Wire.kXR_oksofar
