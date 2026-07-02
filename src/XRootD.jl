@@ -22,5 +22,6 @@ Julia translation of that prior work.
 module XRootD
 
 include("Wire/Wire.jl")
+include("Session/Session.jl")
 
 end # module XRootD
