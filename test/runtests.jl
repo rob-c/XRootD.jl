@@ -32,6 +32,7 @@ end
     include("client/test_types.jl")
     include("client/test_file.jl")
     include("storage/test_storage.jl")
+    include("tools/test_tools.jl")
     include("test_quality.jl")
 
     if XRootD_jll.is_available()
@@ -43,6 +44,7 @@ end
                 include("legacy/testFile.jl")
                 include("integration/test_file_v5.jl")
                 include("integration/test_extended.jl")
+                include("integration/test_tools.jl")
                 include("integration/test_tls.jl")
             finally
                 kill(xrootd_server)

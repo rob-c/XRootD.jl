@@ -32,13 +32,15 @@ treated as a local path (`scheme = "file"`). XRootD URLs keep their
 double-slash path convention (`root://host//path` → `/path`).
 """
 function parse_url(url::AbstractString)
+    url = String(url)
     m = match(r"^([A-Za-z0-9]+)://([^/]*)(/.*)?$", url)
     if m === nothing
         return StorageURL("file", "", 0, String(url), false, String(url))
     end
     scheme = lowercase(String(something(m.captures[1])))
     authority = String(something(m.captures[2]))
-    rawpath = m.captures[3] === nothing ? "" : String(m.captures[3])
+    pathcap = m.captures[3]
+    rawpath = pathcap === nothing ? "" : String(pathcap)
 
     host, port = split_authority(authority, get(_DEFAULT_PORTS, scheme, 0))
     # XRootD uses root://host//path; collapse the leading double slash.

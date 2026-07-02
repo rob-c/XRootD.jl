@@ -28,7 +28,7 @@ mutable struct Connection
     signing_key::Union{Vector{UInt8},Nothing}
     sig_seqno::UInt64
     last_activity::Float64                   # time() of the last frame sent
-    keepalive::Union{Timer,Nothing}
+    keepalive::Union{Task,Nothing}
 end
 
 """
@@ -123,17 +123,19 @@ idle at least that long, send a `kXR_ping` so a long-lived handle survives
 the server's idle timeout. The timer is cancelled on [`close`](@ref).
 """
 function start_keepalive!(conn::Connection, interval::Float64)
-    conn.keepalive = Timer(interval; interval=interval) do _
-        (conn.closed || !isopen(conn.sock)) && return nothing
-        if time() - conn.last_activity >= interval
-            try
-                roundtrip(conn, Wire.PingRequest())
-            catch
-                # a failed ping just means the reader task will tear down
+    conn.keepalive = errormonitor(Threads.@spawn begin
+        while !conn.closed
+            sleep(interval)
+            conn.closed && break
+            if time() - conn.last_activity >= interval
+                try
+                    roundtrip(conn, Wire.PingRequest())
+                catch
+                    # a failed ping just means the reader task will tear down
+                end
             end
         end
-        return nothing
-    end
+    end)
     return nothing
 end
 
@@ -339,10 +341,7 @@ function roundtrip(conn::Connection, req::Wire.Request)
 end
 
 function Base.close(conn::Connection)
-    conn.closed = true
-    ka = conn.keepalive
-    ka === nothing || close(ka)
-    conn.keepalive = nothing
+    conn.closed = true   # signals the keepalive task's loop to exit
     isopen(conn.sock) && close(conn.sock)
     return nothing
 end

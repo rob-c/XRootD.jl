@@ -25,6 +25,7 @@ include("Wire/Wire.jl")
 include("Session/Session.jl")
 include("Client/XrdCl.jl")
 include("Storage/Storage.jl")
+include("Tools/Tools.jl")
 
 using Sockets: Sockets
 include("precompile.jl")

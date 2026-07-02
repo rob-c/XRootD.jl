@@ -34,7 +34,7 @@ Plans 01–06 constraints, plus (ground truth: libxrdc `copy*.c`, `apps/`):
 ## Tasks
 
 ### Task 1: Copy engine
-- [ ] `copyfile(src_url, dst_url; force, verify, parallel)` over Storage: a
+- [x] `copyfile(src_url, dst_url; force, verify, parallel)` over Storage: a
   chunked pump with a bounded window of in-flight reads (parallel chunks on
   a multiplexed connection), optional post-copy checksum verification;
   `copytree(src, dst)` recursive. Tests: local→local, and (integration)
@@ -42,26 +42,26 @@ Plans 01–06 constraints, plus (ground truth: libxrdc `copy*.c`, `apps/`):
   `feat(tools): backend-agnostic copy engine`.
 
 ### Task 2: Checksums
-- [ ] `Checksums` module: `adler32`, `crc32c`, `crc64xz` over an IO/bytes;
+- [x] `Checksums` module: `adler32`, `crc32c`, `crc64xz` over an IO/bytes;
   `checksum_file(url, algo)` (local or root://); `verify_file(url)` against
   an xattr/`.cks` record. Unit tests vs known vectors; integration vs a
   root:// file. Commit `feat(tools): checksum algorithms`.
 
 ### Task 3: xrdcp
-- [ ] `Tools.Xrdcp.main(args)`: parse `[-f] [-r] [--verify] src dst`, drive
+- [x] `Tools.Xrdcp.main(args)`: parse `[-f] [-r] [--verify] src dst`, drive
   the copy engine, map to an exit code. `bin/xrdcp.jl` launcher. Tests:
   invoke `main` in-process for local→root→local round trips; a byte-compare
   against the source. Commit `feat(tools): xrdcp`.
 
 ### Task 4: xrdfs
-- [ ] `Tools.Xrdfs.main(args)`: subcommands `ls`/`stat`/`mkdir`/`rm`/
+- [x] `Tools.Xrdfs.main(args)`: subcommands `ls`/`stat`/`mkdir`/`rm`/
   `rmdir`/`mv`/`cat`/`query`/`statvfs` against a `root://` host; a no-command
   interactive REPL loop. `bin/xrdfs.jl`. Tests: `main(["host","ls","/tmp"])`
   etc. against XRootD_jll, asserting output + exit code. Commit
   `feat(tools): xrdfs`.
 
 ### Task 5: checksum CLIs
-- [ ] `bin/xrdadler32.jl`, `bin/xrdcrc32c.jl`, `bin/xrdcrc64.jl`,
+- [x] `bin/xrdadler32.jl`, `bin/xrdcrc32c.jl`, `bin/xrdcrc64.jl`,
   `bin/xrdckverify.jl` over the Checksums module, each a `main(args)` +
   launcher with libxrdc-style output and exit codes; `--version` credits
   libxrdc. Tests: compute a known file's digest, verify pass/fail. Commit

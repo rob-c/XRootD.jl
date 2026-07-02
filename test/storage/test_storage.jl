@@ -75,10 +75,7 @@ using Dates: DateTime
         )
         router = HTTP.Router()
         HTTP.register!(
-            router,
-            "GET",
-            "/**",
-            function (req)
+            router, "GET", "/**", function (req)
                 data = get(served, req.target, nothing)
                 data === nothing && return HTTP.Response(404)
                 for (k, v) in req.headers
@@ -96,7 +93,7 @@ using Dates: DateTime
                     end
                 end
                 return HTTP.Response(200, data)
-            end,
+            end
         )
         HTTP.register!(
             router,
