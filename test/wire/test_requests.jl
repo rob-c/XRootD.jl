@@ -223,6 +223,39 @@ using CRC32c: crc32c
         @test w2[57:59] == UInt8[0x01, 0x02, 0x03]  # concatenated data trailer
     end
 
+    @testset "vector limits are enforced at construction" begin
+        seg(off, len) = (; fhandle=fh, offset=Int64(off), rlen=Int32(len))
+        @test_throws ArgumentError ReadVRequest(typeof(seg(0, 1))[])
+        @test_throws ArgumentError ReadVRequest([
+            seg(i, 1) for i in 0:(Wire.VEC_MAXSEGS)
+        ])
+        @test_throws ArgumentError ReadVRequest([seg(0, -1)])
+        @test_throws ArgumentError ReadVRequest([
+            seg(0, Wire.VEC_MAXBYTES ÷ 2 + 1), seg(1 << 30, Wire.VEC_MAXBYTES ÷ 2 + 1)
+        ])
+
+        wseg(off, n) = (; fhandle=fh, offset=Int64(off), data=zeros(UInt8, n))
+        @test_throws ArgumentError WriteVRequest(typeof(wseg(0, 1))[]; do_sync=false)
+        @test_throws ArgumentError WriteVRequest(
+            [wseg(i, 1) for i in 0:(Wire.VEC_MAXSEGS)]; do_sync=false
+        )
+    end
+
+    @testset "reply caps bound what a server may answer" begin
+        r = ReadVRequest([
+            (; fhandle=fh, offset=Int64(0), rlen=Int32(16)),
+            (; fhandle=fh, offset=Int64(4096), rlen=Int32(32)),
+        ])
+        @test Wire.readv_reply_cap(r) == 2 * 16 + 48
+
+        p = PgReadRequest(fh, Int64(0), Int32(2 * Wire.kXR_pgPageSZ))
+        # 2 full pages + 2 pages of slack, each with a CRC and a status body
+        @test Wire.pgread_reply_cap(p) == 2 * Wire.kXR_pgPageSZ + 4 * (4 + 24)
+
+        pw = PgWriteRequest(fh, Int64(0), zeros(UInt8, Wire.kXR_pgPageSZ + 1))
+        @test Wire.pgwrite_reply_cap(pw) == 24 + Wire.PGW_CSE_HDRLEN + 8 * 3
+    end
+
     @testset "pgread / pgwrite" begin
         p = encode(PgReadRequest(fh, Int64(4096), Int32(8192)), UInt16(9))
         @test p[3:4] == UInt8[0x0b, 0xd6]        # kXR_pgread (3030)

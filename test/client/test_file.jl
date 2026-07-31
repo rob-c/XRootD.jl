@@ -1,8 +1,9 @@
 # File API over the mock server from test/session/test_connection.jl
 # (start_mock_server + MOCK_CONTENT are defined there and shared via Main).
 
+using XRootD: Wire
 using XRootD.XrdCl
-using XRootD.XrdCl: sync, pgread
+using XRootD.XrdCl: sync, pgread, pgwrite, readv
 
 @testset "File over mock server" begin
     port = start_mock_server()
@@ -81,6 +82,40 @@ using XRootD.XrdCl: sync, pgread
         st, data = pgread(f, 10, 0)
         @test isOK(st)
         @test String(data) == "HelloWorld"
+        close(f)
+    end
+
+    @testset "pgwrite retries the pages the server reports corrupt" begin
+        f = File("$base//data", OpenFlags.Update)
+        data = Vector{UInt8}(codeunits("paged payload"))
+        st, _ = pgwrite(f, data, 0)
+        @test isOK(st)
+        # the resend carried exactly the corrupt page, CRC32c and all
+        @test PGWRITE_LAST[] == Wire.encode_pages(data, Int64(0))
+        close(f)
+    end
+
+    @testset "pgwrite gives up on a page that stays corrupt" begin
+        f = File("$base//data", OpenFlags.Update)
+        st, _ = pgwrite(f, Vector{UInt8}(codeunits("doomed")), 8192)
+        @test isError(st)
+        @test occursin("still corrupt after $(Wire.PGW_MAX_RETRY) retries", st.message)
+        close(f)
+    end
+
+    @testset "readv" begin
+        f = File("$base//data")
+        st, chunks = readv(f, [(0, 5), (6, 5)])
+        @test isOK(st)
+        @test String.(chunks) == ["Hello", "World"]
+        # a reply missing a segment is a stopped transfer, not a short read
+        st, chunks = readv(f, [(0, 5), (MOCK_DROP_OFFSET, 5)])
+        @test isError(st)
+        @test chunks === nothing
+        @test occursin("1 of 2 segments", st.message)
+        # local validation rejects an over-large vector before it hits the wire
+        st, _ = readv(f, [(i, 1) for i in 0:(Wire.VEC_MAXSEGS)])
+        @test isError(st)
         close(f)
     end
 

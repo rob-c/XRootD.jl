@@ -184,4 +184,14 @@ end
         pg[5] ⊻= 0xff
         @test_throws ArgumentError decode_pages(pg, off)
     end
+
+    @testset "pgwrite checksum-error trailer" begin
+        # cseCRC[4] dlFirst[2] dlLast[2] then one big-endian offset per page
+        hdr = vcat(zeros(UInt8, 4), UInt8[0x00, 0x10], UInt8[0x10, 0x00])
+        off(v) = Wire.set_u64!(zeros(UInt8, 8), 1, UInt64(v))
+        @test Wire.parse_pgwrite_cse(hdr) == Int64[]
+        @test Wire.parse_pgwrite_cse(vcat(hdr, off(0), off(8192))) == Int64[0, 8192]
+        @test_throws ArgumentError Wire.parse_pgwrite_cse(UInt8[0x00, 0x01])
+        @test_throws ArgumentError Wire.parse_pgwrite_cse(vcat(hdr, zeros(UInt8, 7)))
+    end
 end

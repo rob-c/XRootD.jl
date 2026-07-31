@@ -151,6 +151,16 @@ const kXR_FinalResult   = 0x00   # kXR_status resptype: last frame
 const kXR_PartialResult = 0x01   # kXR_status resptype: more frames follow
 const STATUS_BODY_LEN   = 24     # kXR_status body: crc[4] sid[2] reqid[1]
                                  # resptype[1] rsvd[4] dlen[4] offset[8]
+const PGW_CSE_HDRLEN    = 8      # pgwrite CSE trailer: cseCRC[4] dlFirst[2] dlLast[2]
+const PGW_MAX_RETRY     = 3      # kXR_pgRetry attempts per corrupt page
+
+# ---- client-side I/O caps (libxrdc brix_ops.h / brix.h) ----
+# A response is untrusted input: every accumulating read bounds what it will
+# buffer, so a server that keeps sending kXR_oksofar cannot grow the client's
+# heap without limit.
+const VEC_MAXSEGS  = 1024                # readv/writev segment count cap
+const VEC_MAXBYTES = 256 * 1024 * 1024   # aggregate readv/writev payload cap
+const DLEN_MAX     = 64 * 1024 * 1024    # sanity cap on one response body
 
 # ---- stat flags bitfield (flags.h; StatInfo.flags) ----
 const kXR_xset     = UInt32(0x01)  # executable / searchable

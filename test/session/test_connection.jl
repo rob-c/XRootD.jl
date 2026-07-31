@@ -52,6 +52,17 @@ end
 "18 bytes of mock file content served by kXR_open/read handles."
 const MOCK_CONTENT = Vector{UInt8}(codeunits("Hello\nWorld\nFolks!"))
 
+"A pgwrite checksum-error trailer naming the single page at `offset`."
+function cse_trailer(offset::Integer)
+    return vcat(zeros(UInt8, 8), Wire.set_u64!(zeros(UInt8, 8), 1, UInt64(offset)))
+end
+
+"Payload of the most recent kXR_pgwrite the mock handled (for assertions)."
+const PGWRITE_LAST = Ref(UInt8[])
+
+"A readv segment at this file offset is dropped from the reply."
+const MOCK_DROP_OFFSET = 4096
+
 function serve_client(sock)
     try
         serve_bringup(sock)
@@ -101,6 +112,34 @@ function serve_client(sock)
                 write(sock, status_frame(sid, Wire.kXR_PartialResult, 0, p1))
                 p2 = Wire.encode_pages(Vector{UInt8}(codeunits("World")), Int64(5))
                 write(sock, status_frame(sid, Wire.kXR_FinalResult, 5, p2))
+            elseif rid == Wire.kXR_pgwrite
+                # Page at file offset 0 is reported corrupt once and accepted
+                # on the kXR_pgRetry resend; the page at 8192 stays corrupt
+                # forever, exercising the bounded retry budget.
+                offset = Int(reinterpret(Int64, Wire.get_u64(frame, 9)))
+                retry = (frame[18] & Wire.kXR_pgRetry) != 0
+                PGWRITE_LAST[] = copy(payload)
+                cse = retry && offset == 0 ? UInt8[] : cse_trailer(offset)
+                write(sock, status_frame(sid, Wire.kXR_FinalResult, offset, cse))
+            elseif rid == Wire.kXR_readv
+                # Echo one 16-byte header + the requested bytes per segment.
+                # A segment at MOCK_DROP_OFFSET is silently omitted, modelling
+                # a server that stops short of the requested vector.
+                out = UInt8[]
+                nseg = length(payload) ÷ 16
+                for i in 1:nseg
+                    off = 16 * (i - 1)
+                    rlen = Int(reinterpret(Int32, Wire.get_u32(payload, off + 5)))
+                    foff = Int(reinterpret(Int64, Wire.get_u64(payload, off + 9)))
+                    foff == MOCK_DROP_OFFSET && continue
+                    lo, hi = foff + 1, min(foff + rlen, length(MOCK_CONTENT))
+                    data = lo <= hi ? MOCK_CONTENT[lo:hi] : UInt8[]
+                    hdr = copy(payload[(off + 1):(off + 16)])
+                    Wire.set_u32!(hdr, 5, UInt32(length(data)))
+                    append!(out, hdr)
+                    append!(out, data)
+                end
+                write(sock, vcat(resp_hdr(sid, Wire.kXR_ok, length(out)), out))
             elseif rid == Wire.kXR_query
                 # never answered — exercises close() failing pending requests
             end
@@ -180,6 +219,30 @@ end
         @test s2.offset == 5
         d2 = Wire.decode_pages(body[(cursor + 25):end], s2.offset)
         @test String(vcat(d1, d2)) == "HelloWorld"
+    end
+
+    @testset "reply cap refuses an over-answering server" begin
+        fh = (0x09, 0x09, 0x09, 0x09)
+        req = Wire.ReadRequest(fh, Int64(0), Int32(length(MOCK_CONTENT)))
+        hdr, body = Session.roundtrip(conn, req; maxbytes=4)
+        @test hdr.status == Wire.kXR_error
+        @test occursin("exceeds the 4-byte cap", Wire.decode_error(body).message)
+        # the connection stays usable afterwards
+        @test Session.roundtrip(conn, Wire.PingRequest())[1].status == Wire.kXR_ok
+    end
+
+    @testset "stall deadline bounds a silent server" begin
+        stalled = Session.connect("127.0.0.1", port; username="tester")
+        stalled.stall_deadline_ms = 200
+        try
+            t0 = time()
+            hdr, body = Session.roundtrip(stalled, Wire.QueryRequest(Wire.kXR_QStats, "x"))
+            @test hdr.status == Wire.kXR_error
+            @test occursin("stall deadline", Wire.decode_error(body).message)
+            @test time() - t0 < 5.0
+        finally
+            close(stalled)
+        end
     end
 
     @testset "close fails pending requests" begin

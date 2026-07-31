@@ -45,13 +45,17 @@ end
 
 closed_status() = XRootDStatus(0x0001, 0x0000, 0, "file is not open")
 
-"Run one request on the file's connection, mapping failures to statuses."
-function fperform(f::File, req::Wire.Request)
+"""
+Run one request on the file's connection, mapping failures to statuses.
+`maxbytes` bounds the reply the Session layer will accumulate (0 = unbounded);
+every read passes the largest reply its request can legitimately produce.
+"""
+function fperform(f::File, req::Wire.Request; maxbytes::Integer=0)
     f.isopen || return closed_status(), UInt8[]
     conn = f.conn
     conn === nothing && return closed_status(), UInt8[]
     hdr, body = try
-        Session.roundtrip(conn, req)
+        Session.roundtrip(conn, req; maxbytes=maxbytes)
     catch err
         return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), UInt8[]
     end
@@ -155,7 +159,9 @@ function Base.read(f::File, size, offset=0)
     if offset != 0
         f.currentOffset = offset
     end
-    st, body = fperform(f, Wire.ReadRequest(f.fhandle, f.currentOffset, Int32(size)))
+    st, body = fperform(
+        f, Wire.ReadRequest(f.fhandle, f.currentOffset, Int32(size)); maxbytes=Int(size)
+    )
     isOK(st) || return st, nothing
     return st, body
 end
@@ -167,7 +173,9 @@ Read up to `size` bytes at `offset` (used directly, independent of the
 cursor) into `ptr`. Returns `(status, nbytes)` — 0 on failure.
 """
 function Base.unsafe_read(f::File, ptr::Ptr, size, offset=0)
-    st, body = fperform(f, Wire.ReadRequest(f.fhandle, Int64(offset), Int32(size)))
+    st, body = fperform(
+        f, Wire.ReadRequest(f.fhandle, Int64(offset), Int32(size)); maxbytes=Int(size)
+    )
     isOK(st) || return st, 0
     n = length(body)
     GC.@preserve body unsafe_copyto!(Ptr{UInt8}(ptr), pointer(body), n)
@@ -210,7 +218,9 @@ function Base.readline(f::File, size=0, offset=0, chunk=0)
     line = UInt8[]
     st = XRootDStatus()
     while pos < pos_end
-        rst, body = fperform(f, Wire.ReadRequest(f.fhandle, pos, Int32(chunk)))
+        rst, body = fperform(
+            f, Wire.ReadRequest(f.fhandle, pos, Int32(chunk)); maxbytes=Int(chunk)
+        )
         st = rst
         isError(st) && return st, nothing
         isempty(body) && break
@@ -255,20 +265,45 @@ function sync(f::File)
     return st, nothing
 end
 
+"Turn a request-construction or decode failure into a 0.2.x error status."
+local_error(err) = XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err))
+
 """
     readv(f::File, chunks::Vector{<:Tuple{Integer,Integer}})
 
 Scatter-gather read: `chunks` is `(offset, size)` pairs. Returns
 `(status, Vector{Vector{UInt8}} | nothing)` with the data per chunk in
 request order.
+
+A reply that decodes to fewer segments than were requested is a stopped
+transfer, not a short one: it fails rather than returning partial data.
 """
 function readv(f::File, chunks::Vector{<:Tuple{Integer,Integer}})
-    segments = [
-        (; fhandle=f.fhandle, offset=Int64(off), rlen=Int32(len)) for (off, len) in chunks
-    ]
-    st, body = fperform(f, Wire.ReadVRequest(segments))
+    req = try
+        Wire.ReadVRequest([
+            (; fhandle=f.fhandle, offset=Int64(off), rlen=Int32(len)) for
+            (off, len) in chunks
+        ])
+    catch err
+        return local_error(err), nothing
+    end
+    st, body = fperform(f, req; maxbytes=Wire.readv_reply_cap(req))
     isOK(st) || return st, nothing
-    return st, [Vector{UInt8}(seg.data) for seg in Wire.parse_readv(body)]
+    segments = try
+        Wire.parse_readv(body)
+    catch err
+        return local_error(err), nothing
+    end
+    if length(segments) != length(chunks)
+        return XRootDStatus(
+            0x0001,
+            0x0000,
+            0,
+            "readv returned $(length(segments)) of $(length(chunks)) segments",
+        ),
+        nothing
+    end
+    return st, [Vector{UInt8}(seg.data) for seg in segments]
 end
 
 """
@@ -280,10 +315,15 @@ Scatter-gather write, all-or-nothing: `chunks` is `(offset, data)` pairs;
 function writev(
     f::File, chunks::Vector{<:Tuple{Integer,Vector{UInt8}}}; do_sync::Bool=false
 )
-    segments = [
-        (; fhandle=f.fhandle, offset=Int64(off), data=data) for (off, data) in chunks
-    ]
-    st, _ = fperform(f, Wire.WriteVRequest(segments; do_sync=do_sync))
+    req = try
+        Wire.WriteVRequest(
+            [(; fhandle=f.fhandle, offset=Int64(off), data=data) for (off, data) in chunks];
+            do_sync=do_sync,
+        )
+    catch err
+        return local_error(err), nothing
+    end
+    st, _ = fperform(f, req)
     return st, nothing
 end
 
@@ -298,8 +338,9 @@ function pgread(f::File, size, offset=0)
     f.isopen || return closed_status(), nothing
     conn = f.conn
     conn === nothing && return closed_status(), nothing
+    req = Wire.PgReadRequest(f.fhandle, Int64(offset), Int32(size))
     hdr, body = try
-        Session.roundtrip(conn, Wire.PgReadRequest(f.fhandle, Int64(offset), Int32(size)))
+        Session.roundtrip(conn, req; maxbytes=Wire.pgread_reply_cap(req))
     catch err
         return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
     end
@@ -321,32 +362,89 @@ function pgread(f::File, size, offset=0)
 end
 
 """
+Send one `kXR_pgwrite` and return `(status, cse)` where `cse` is the reply's
+checksum-error trailer (empty when the server took every page). `reqflags` is
+`Wire.kXR_pgRetry` for a resend of a single corrupt page.
+"""
+function pgwrite_once(f::File, offset::Int64, data::Vector{UInt8}, reqflags::UInt8)
+    f.isopen || return closed_status(), UInt8[]
+    conn = f.conn
+    conn === nothing && return closed_status(), UInt8[]
+    req = Wire.PgWriteRequest(f.fhandle, offset, data; reqflags=reqflags)
+    hdr, body = try
+        Session.roundtrip(conn, req; maxbytes=Wire.pgwrite_reply_cap(req))
+    catch err
+        return local_error(err), UInt8[]
+    end
+    hdr.status == Wire.kXR_status || return status_from(hdr, body), UInt8[]
+    s = try
+        Wire.decode_status_body(view(body, 1:min(Wire.STATUS_BODY_LEN, length(body))))
+    catch err
+        return local_error(err), UInt8[]
+    end
+    n = Int(s.pgdlen)
+    n == 0 && return XRootDStatus(), UInt8[]
+    if length(body) < Wire.STATUS_BODY_LEN + n
+        return XRootDStatus(
+            0x0001, 0x0000, 0, "pgwrite: truncated checksum-error trailer"
+        ),
+        UInt8[]
+    end
+    return XRootDStatus(),
+    Vector{UInt8}(body[(Wire.STATUS_BODY_LEN + 1):(Wire.STATUS_BODY_LEN + n)])
+end
+
+"""
+Resend the page at file offset `pgoff` (sliced out of `data`, which starts at
+file offset `base`) with `kXR_pgRetry`, up to `Wire.PGW_MAX_RETRY` times.
+Returns an OK status once the server accepts the page, an integrity error if
+it stays corrupt past the budget.
+"""
+function pgwrite_retry_page(f::File, data::Vector{UInt8}, base::Int64, pgoff::Int64)
+    doff = pgoff - base
+    if doff < 0 || doff >= length(data)
+        return XRootDStatus(
+            0x0001, 0x0000, 0, "pgwrite: corrupt-page offset $pgoff outside the request"
+        )
+    end
+    n = Wire.page_span(pgoff, length(data) - doff)
+    page = data[(doff + 1):(doff + n)]
+    for _ in 1:(Wire.PGW_MAX_RETRY)
+        st, cse = pgwrite_once(f, pgoff, page, Wire.kXR_pgRetry)
+        isOK(st) || return st
+        isempty(cse) && return st
+    end
+    return XRootDStatus(
+        0x0001,
+        0x0000,
+        0,
+        "pgwrite: page at offset $pgoff still corrupt after " *
+        "$(Wire.PGW_MAX_RETRY) retries",
+    )
+end
+
+"""
     pgwrite(f::File, data::Vector{UInt8}, offset=0)
 
-Paged write with per-page CRC32c (`kXR_pgwrite`, protocol v5). A non-empty
-checksum-error trailer in the reply (corrupt pages on the server side)
-yields an error status. Returns `(status, nothing)`.
+Paged write with per-page CRC32c (`kXR_pgwrite`, protocol v5). The server
+stores the data and answers with a checksum-error trailer listing any page
+whose CRC32c did not survive the wire; each of those pages is retransmitted
+with `kXR_pgRetry` until the server accepts it or the bounded retry budget is
+exhausted, which fails the write (libxrdc `pgwrite_handle_cse`). Returns
+`(status, nothing)`.
 """
 function pgwrite(f::File, data::Vector{UInt8}, offset=0)
-    f.isopen || return closed_status(), nothing
-    conn = f.conn
-    conn === nothing && return closed_status(), nothing
-    hdr, body = try
-        Session.roundtrip(conn, Wire.PgWriteRequest(f.fhandle, Int64(offset), data))
+    st, cse = pgwrite_once(f, Int64(offset), data, 0x00)
+    isOK(st) || return st, nothing
+    isempty(cse) && return st, nothing
+    bad = try
+        Wire.parse_pgwrite_cse(cse)
     catch err
-        return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
+        return local_error(err), nothing
     end
-    hdr.status == Wire.kXR_status || return status_from(hdr, body), nothing
-    s = try
-        Wire.decode_status_body(view(body, 1:min(24, length(body))))
-    catch err
-        return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
-    end
-    if s.pgdlen != 0
-        return XRootDStatus(
-            0x0001, 0x0000, 0, "pgwrite reported $(s.pgdlen) bytes of corrupt-page info"
-        ),
-        nothing
+    for pgoff in bad
+        rst = pgwrite_retry_page(f, data, Int64(offset), pgoff)
+        isOK(rst) || return rst, nothing
     end
     return XRootDStatus(), nothing
 end

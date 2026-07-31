@@ -445,15 +445,58 @@ const WriteVSegment = @NamedTuple{
 }
 
 """
+    check_vector_limits(nseg, total, what)
+
+Reject a vector request that exceeds the client's segment-count
+([`VEC_MAXSEGS`](@ref)) or aggregate-byte ([`VEC_MAXBYTES`](@ref)) caps, or
+that carries no segments at all (libxrdc `brix_file_readv` / `brix_file_writev`
+apply the same bounds before touching the wire). `what` names the operation in
+the error message.
+"""
+function check_vector_limits(nseg::Integer, total::Integer, what::AbstractString)
+    if nseg < 1 || nseg > VEC_MAXSEGS
+        throw(ArgumentError("$what: bad segment count $nseg (want 1..$(VEC_MAXSEGS))"))
+    end
+    if total < 0 || total > VEC_MAXBYTES
+        throw(ArgumentError("$what: payload $total exceeds $(VEC_MAXBYTES) bytes"))
+    end
+    return nothing
+end
+
+"""
     ReadVRequest(segments::Vector{ReadVSegment})
 
 `kXR_readv` — scatter-gather read. The payload is one 16-byte
 `readahead_list` entry per segment (`fhandle[4] + rlen[4] + offset[8]`, all
 big-endian). The response interleaves a 16-byte echo header (carrying the
 ACTUAL length) and the data per segment — see [`parse_readv`](@ref).
+
+The segment count and the total requested length are bounded by
+[`check_vector_limits`](@ref).
 """
 struct ReadVRequest <: Request
     segments::Vector{ReadVSegment}
+
+    function ReadVRequest(segments::Vector{ReadVSegment})
+        total = 0
+        for seg in segments
+            seg.rlen < 0 && throw(ArgumentError("readv: negative rlen $(seg.rlen)"))
+            total += Int(seg.rlen)
+        end
+        check_vector_limits(length(segments), total, "readv")
+        return new(segments)
+    end
+end
+
+"""
+    readv_reply_cap(r::ReadVRequest) -> Int
+
+The largest legitimate `kXR_readv` reply for `r`: one 16-byte echo header per
+segment plus at most the requested bytes. The Session layer refuses to
+accumulate beyond this.
+"""
+function readv_reply_cap(r::ReadVRequest)
+    return 16 * length(r.segments) + sum(Int(seg.rlen) for seg in r.segments; init=0)
 end
 
 requestid(::ReadVRequest) = kXR_readv
@@ -476,13 +519,23 @@ end
 protocol, `dlen` covers ONLY the `write_list` descriptor block (stock
 servers enforce `dlen % 16 == 0` and answer `kXR_ArgInvalid: "Write vector
 is invalid"` otherwise); the concatenated segment data streams after the
-frame as a [`trailer`](@ref). Note libxrdc `xrdc_file_writev` counts the
-data inside `dlen`, which only its own server accepts — a parity finding
-discovered against stock xrootd 5.8. `do_sync` sets `kXR_wv_doSync`.
+frame as a [`trailer`](@ref). libxrdc counted the data inside `dlen` until
+this framing was confirmed against stock xrootd 5.8 and its own standalone
+`writev.c` handler; `brix_file_writev` now sends the descriptors-only form
+too. `do_sync` sets `kXR_wv_doSync`.
+
+The segment count and the total payload are bounded by
+[`check_vector_limits`](@ref).
 """
 struct WriteVRequest <: Request
     segments::Vector{WriteVSegment}
     do_sync::Bool
+
+    function WriteVRequest(segments::Vector{WriteVSegment}, do_sync::Bool)
+        total = sum(length(seg.data) for seg in segments; init=0)
+        check_vector_limits(length(segments), total, "writev")
+        return new(segments, do_sync)
+    end
 end
 
 function WriteVRequest(segments::Vector{WriteVSegment}; do_sync::Bool=false)
@@ -536,6 +589,21 @@ function body!(frame::Vector{UInt8}, r::PgReadRequest)
 end
 
 """
+    pgread_reply_cap(r::PgReadRequest) -> Int
+
+The largest legitimate `kXR_pgread` reply for `r`: the requested bytes plus a
+4-byte CRC32c and a 24-byte `kXR_status` body per page (the worst case is one
+partial frame per page). Bounding the accumulation this way also bounds a
+server that answers with an unending stream of empty partial frames.
+"""
+function pgread_reply_cap(r::PgReadRequest)
+    # +2 pages of slack: the first page may be short when the offset is not
+    # page aligned, and the server may close with an empty final frame.
+    npages = cld(Int(r.rlen), kXR_pgPageSZ) + 2
+    return Int(r.rlen) + npages * (4 + STATUS_BODY_LEN)
+end
+
+"""
     PgWriteRequest(fhandle, offset::Int64, data::Vector{UInt8}; reqflags::UInt8=0x00)
 
 `kXR_pgwrite` — paged write. The payload is built with
@@ -566,6 +634,18 @@ function body!(frame::Vector{UInt8}, r::PgWriteRequest)
 end
 
 payload(r::PgWriteRequest) = encode_pages(r.data, r.offset)
+
+"""
+    pgwrite_reply_cap(r::PgWriteRequest) -> Int
+
+The largest legitimate `kXR_pgwrite` reply for `r`: the `kXR_status` body plus
+a checksum-error trailer ([`parse_pgwrite_cse`](@ref)) naming at most every
+page the request wrote.
+"""
+function pgwrite_reply_cap(r::PgWriteRequest)
+    npages = cld(length(r.data), kXR_pgPageSZ) + 1
+    return STATUS_BODY_LEN + PGW_CSE_HDRLEN + 8 * npages
+end
 
 # ---- request signing (kXR_sigver; libxrdc sigver.c) ----
 

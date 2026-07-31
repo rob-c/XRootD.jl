@@ -200,6 +200,26 @@ function decode_status_body(sb::AbstractVector{UInt8})
     )
 end
 
+"""
+    parse_pgwrite_cse(cse) -> Vector{Int64}
+
+Decode the checksum-error trailer of a `kXR_pgwrite` reply: the 8-byte header
+`cseCRC[4] + dlFirst[2] + dlLast[2]`, then one big-endian `int64` file offset
+per page whose CRC32c did not match on arrival. The server has written the
+data; those pages must be retransmitted with `kXR_pgRetry` (libxrdc
+`pgwrite_handle_cse`). Throws `ArgumentError` on a malformed trailer.
+"""
+function parse_pgwrite_cse(cse::AbstractVector{UInt8})
+    n = length(cse)
+    if n < PGW_CSE_HDRLEN || (n - PGW_CSE_HDRLEN) % 8 != 0
+        throw(ArgumentError("malformed pgwrite CSE trailer ($n bytes)"))
+    end
+    nbad = (n - PGW_CSE_HDRLEN) ÷ 8
+    return [
+        reinterpret(Int64, get_u64(cse, PGW_CSE_HDRLEN + 8 * (i - 1) + 1)) for i in 1:nbad
+    ]
+end
+
 "Length of the page starting at file offset `off` with `remaining` bytes left."
 function page_span(off::Int64, remaining::Integer)
     to_boundary = kXR_pgPageSZ - Int(off & (kXR_pgPageSZ - 1))

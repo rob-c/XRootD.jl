@@ -25,7 +25,15 @@ three-way parity tier: XRootD.jl vs libxrdc vs official `xrdcp`).
 
 ---
 
-## 1. `kXR_writev` — the libxrdc client contradicts nginx-xrootd's own server  **[BUG]**
+## 1. `kXR_writev` — the libxrdc client contradicts nginx-xrootd's own server  **[BUG — FIXED UPSTREAM]**
+
+> **Resolved 2026-07-31** (nginx-xrootd `bc8688823`). `brix_file_writev`
+> (`client/lib/protocols/root/ops_file_rw.c`) now sends
+> `brix_payload_ext pe = { payload, plen, nseg * 16 }` — the full buffer goes
+> on the wire, the header `dlen` frames the descriptor block alone. Item 1 of
+> "to check" below is done; items 2 and 3 (checkpoint framing, server-vs-client
+> test) still stand. The rest of this section is kept as the record of the
+> diagnosis.
 
 **Observed.** XRootD.jl's first `kXR_writev` framing (data counted inside
 `dlen`, copied from libxrdc) was rejected by stock xrootd with
