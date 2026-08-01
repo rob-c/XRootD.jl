@@ -32,7 +32,7 @@ function S3Backend(u::StorageURL; creds::S3Credentials=S3Credentials(), endpoint
     # s3://bucket/key — the host is the bucket, the path is the key.
     bucket = u.host
     key = lstrip(u.path, '/')
-    host = endpoint === nothing ? "$bucket.s3.amazonaws.com" : String(endpoint)
+    host = endpoint === nothing ? "$bucket.s3.amazonaws.com" : rstrip(String(endpoint), '/')
     return S3Backend(u, bucket, String(key), creds, host)
 end
 
@@ -116,7 +116,15 @@ function sigv4_headers(
     return out
 end
 
-s3_object_url(b::S3Backend) = "https://$(b.endpoint_host)/$(b.key)"
+"""
+The object's URL. AWS is reached over HTTPS, but an `endpoint` may name its
+own scheme: the S3-compatible services (MinIO, Ceph RGW) are routinely served
+as plain HTTP inside a private network.
+"""
+function s3_object_url(b::S3Backend)
+    occursin("://", b.endpoint_host) && return "$(b.endpoint_host)/$(b.key)"
+    return "https://$(b.endpoint_host)/$(b.key)"
+end
 
 function storage_stat(b::S3Backend)
     url = s3_object_url(b)
@@ -137,7 +145,10 @@ function storage_read(b::S3Backend, sink::IO; offset::Integer=0, length=nothing)
         last = length === nothing ? "" : string(offset + Int(length) - 1)
         push!(extra, "range" => "bytes=$offset-$last")
     end
-    hdrs = sigv4_headers("GET", url, b.creds; headers=extra)
+    # The signature covers `extra`, so `extra` has to travel with it: a
+    # request whose SignedHeaders names a header it does not carry is rejected
+    # as a signature mismatch (and, before that, would fetch the whole object).
+    hdrs = vcat(extra, sigv4_headers("GET", url, b.creds; headers=extra))
     resp = try
         HTTP.request("GET", url, hdrs; status_exception=false)
     catch
@@ -148,9 +159,14 @@ function storage_read(b::S3Backend, sink::IO; offset::Integer=0, length=nothing)
     return :ok
 end
 
+"""
+Upload with a single `PUT`, which holds the object in memory: SigV4 signs a
+hash of the whole payload, so there is nothing to send until every byte has
+arrived. Multipart upload is the way past that, and is not implemented.
+"""
 function storage_write(b::S3Backend, source::IO; length=nothing)
     url = s3_object_url(b)
-    body = length === nothing ? read(source) : read(source, Int(length))
+    body = drain(source, length)
     hdrs = sigv4_headers("PUT", url, b.creds; payload_hash=bytes2hex(sha256(body)))
     resp = try
         HTTP.request("PUT", url, hdrs, body; status_exception=false)

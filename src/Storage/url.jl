@@ -24,6 +24,10 @@ const _DEFAULT_PORTS = Dict(
 
 const _TLS_SCHEMES = Set(["roots", "https", "davs", "s3s"])
 
+"`xroot(s)://` is the documented alias for `root(s)://`; every backend below
+sees the canonical spelling."
+const _SCHEME_ALIASES = Dict("xroot" => "root", "xroots" => "roots")
+
 """
     parse_url(url::AbstractString) -> StorageURL
 
@@ -38,6 +42,7 @@ function parse_url(url::AbstractString)
         return StorageURL("file", "", 0, String(url), false, String(url))
     end
     scheme = lowercase(String(something(m.captures[1])))
+    scheme = get(_SCHEME_ALIASES, scheme, scheme)
     authority = String(something(m.captures[2]))
     pathcap = m.captures[3]
     rawpath = pathcap === nothing ? "" : String(pathcap)

@@ -16,18 +16,14 @@ end
 function storage_read(b::LocalBackend, sink::IO; offset::Integer=0, length=nothing)
     open(b.path, "r") do io
         offset > 0 && seek(io, offset)
-        if length === nothing
-            write(sink, read(io))
-        else
-            write(sink, read(io, Int(length)))
-        end
+        return pump(io, sink, length)
     end
     return :ok
 end
 
 function storage_write(b::LocalBackend, source::IO; length=nothing)
     open(b.path, "w") do io
-        return write(io, length === nothing ? read(source) : read(source, Int(length)))
+        return pump(source, io, length)
     end
     return :ok
 end
@@ -44,5 +40,36 @@ end
 
 function storage_remove(b::LocalBackend)
     rm(b.path; force=true)
+    return :ok
+end
+
+function storage_mkdir(b::LocalBackend)
+    try
+        mkpath(b.path)
+    catch
+        return :error
+    end
+    return :ok
+end
+
+function storage_move(b::LocalBackend, dst_url::AbstractString; overwrite::Bool=false)
+    dst = parse_url(dst_url)
+    dst.scheme == "file" || return :unsupported
+    try
+        mv(b.path, dst.path; force=overwrite)
+    catch
+        return :error
+    end
+    return :ok
+end
+
+function storage_copy(b::LocalBackend, dst_url::AbstractString; overwrite::Bool=false)
+    dst = parse_url(dst_url)
+    dst.scheme == "file" || return :unsupported
+    try
+        cp(b.path, dst.path; force=overwrite)
+    catch
+        return :error
+    end
     return :ok
 end
