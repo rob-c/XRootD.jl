@@ -7,8 +7,8 @@
     File(url::String, flags=0x0000, mode=0x0000) -> File | nothing
 
 A remote file. The one-argument constructors open
-`root://host[:port]//path` immediately and return `nothing` when the open
-fails (0.2.x contract); `File()` creates a closed handle for use with
+`root://[user@]host[:port]//path` immediately and return `nothing` when the
+open fails (0.2.x contract); `File()` creates a closed handle for use with
 [`Base.open`](@ref).
 
 The read cursor follows the 0.2.x rules: `read` does NOT advance it (an
@@ -25,22 +25,24 @@ end
 
 File() = File(nothing, (0x00, 0x00, 0x00, 0x00), 0, 0, false)
 
-function File(url::String, flags=0x0000, mode=0x0000)
+function File(url::String, flags=0x0000, mode=0x0000; kwargs...)
     f = File()
-    st, _ = open(f, url, flags, mode)
+    st, _ = open(f, url, flags, mode; kwargs...)
     return isOK(st) ? f : nothing
 end
 
-"Parse `root://host[:port]//path` into (host, port, path)."
+"Parse `root://[user@]host[:port]//path` into (host, port, path)."
 function parse_file_url(url::AbstractString)
-    m = match(r"^roots?://([^/:@]+)(?::(\d+))?(/.*)$", url)
-    m === nothing && throw(ArgumentError("not a root:// file URL: $(repr(url))"))
-    host = String(something(m.captures[1]))
-    portstr = m.captures[2]
-    port = portstr === nothing ? 1094 : parse(Int, portstr)
-    raw = String(something(m.captures[3]))
-    path = startswith(raw, "//") ? raw[2:end] : raw
-    return host, port, path
+    u = file_url(url)
+    return u.host, u.port, u.path
+end
+
+"The parsed form of a file URL: like [`Session.parse_root_url`](@ref), but a
+file is a path, so a URL that names none is not one."
+function file_url(url::AbstractString)
+    u = Session.parse_root_url(url)
+    isempty(u.path) && throw(ArgumentError("no path in file URL: $(repr(url))"))
+    return u
 end
 
 closed_status() = XRootDStatus(0x0001, 0x0000, 0, "file is not open")
@@ -67,35 +69,84 @@ end
 
 Open `url` on `f`. `flags` composes `OpenFlags` (an open with no access
 bits requests `OpenFlags.Read`); `mode` sets permission bits for created
-files. Returns `(status, nothing)`.
+files. Keywords are forwarded to [`XRootD.Session.connect`](@ref) —
+`insecure_tls`, `token`, `keytab`, `cert`/`key`. Returns `(status, nothing)`.
+
+A `kXR_redirect` answer is followed for up to `max_hops` hops: opening
+through a manager is the normal way a client reaches a data server, and the
+redirector's opaque data travels with the path to the target.
 """
-function Base.open(f::File, url::String, flags=0x0000, mode=0x0000)
+function Base.open(
+    f::File, url::String, flags=0x0000, mode=0x0000; max_hops::Int=8, kwargs...
+)
     f.isopen && return XRootDStatus(0x0001, 0x0000, 0, "file already open"), nothing
-    host, port, path = parse_file_url(url)
-    conn = try
-        Session.connect(host, port)
-    catch err
-        return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
-    end
+    u = file_url(url)
+    host, port, path = u.host, u.port, u.path
+    want_tls = u.scheme == "roots"
+    # A user named in the URL is the login account; an explicit keyword wins.
+    opts = Dict{Symbol,Any}(kwargs)
+    isempty(u.username) || get!(opts, :username, u.username)
     access =
         Wire.kXR_open_read | Wire.kXR_open_updt | Wire.kXR_open_apnd | Wire.kXR_open_wrto
     options = UInt16(flags)
     (options & access) == 0 && (options |= Wire.kXR_open_read)
-    hdr, body = Session.roundtrip(
-        conn, Wire.OpenRequest(path; mode=UInt16(mode), options=options)
-    )
-    st = status_from(hdr, body)
-    if isError(st)
-        close(conn)
+    hops = 0
+    while true
+        conn = try
+            Session.connect(host, port; want_tls=want_tls, opts...)
+        catch err
+            return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
+        end
+        hdr, body = try
+            Session.roundtrip(conn, Wire.OpenRequest(path; mode=UInt16(mode), options=options))
+        catch err
+            close(conn)
+            return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), nothing
+        end
+
+        if hdr.status == Wire.kXR_redirect
+            close(conn)
+            hops += 1
+            hops > max_hops &&
+                return XRootDStatus(hdr.status, 0, 0, "too many redirects"), nothing
+            r = try
+                Wire.decode_redirect(body)
+            catch err
+                return XRootDStatus(
+                    0x0001,
+                    0x0000,
+                    0,
+                    "malformed kXR_redirect: $(sprint(showerror, err))",
+                ),
+                nothing
+            end
+            isempty(r.host) &&
+                return XRootDStatus(0x0001, 0x0000, 0, "kXR_redirect names no host"),
+                nothing
+            host = Session.unbracket(r.host)
+            port, want_tls = redirect_endpoint(r, port, want_tls)
+            path = Wire.merge_cgi(path, r.cgi)
+            continue
+        end
+
+        st = status_from(hdr, body)
+        if isError(st)
+            close(conn)
+            return st, nothing
+        end
+        st, opened = decoded(Wire.decode_open, st, body)
+        if opened === nothing
+            close(conn)
+            return st, nothing
+        end
+        f.conn = conn
+        f.fhandle = opened.fhandle
+        f.isopen = true
+        f.currentOffset = 0
+        stst, si = stat(f)
+        f.filesize = isOK(stst) && si !== nothing ? si.size : 0
         return st, nothing
     end
-    f.conn = conn
-    f.fhandle = Wire.decode_open(body).fhandle
-    f.isopen = true
-    f.currentOffset = 0
-    stst, si = stat(f)
-    f.filesize = isOK(stst) && si !== nothing ? si.size : 0
-    return st, nothing
 end
 
 """
@@ -135,7 +186,9 @@ Stat the open file by handle. Returns `(status, StatInfo | nothing)`.
 function Base.stat(f::File, force::Bool=true)
     st, body = fperform(f, Wire.StatRequest(""; fhandle=f.fhandle))
     isOK(st) || return st, nothing
-    return st, StatInfo(String(copy(body)))
+    return decoded(st, body) do b
+        return StatInfo(String(copy(b)))
+    end
 end
 
 """
@@ -241,18 +294,22 @@ end
     Base.readlines(f::File, size=0, offset=0, chunk=0)
 
 Read all remaining lines (see [`Base.readline`](@ref)). Returns
-`(status, Vector{String})`.
+`(status, Vector{String} | nothing)`.
 """
 function Base.readlines(f::File, size=0, offset=0, chunk=0)
+    # A handle that is not open is at EOF by construction, so the loop below
+    # would report an empty file rather than a closed one.
+    f.isopen || return closed_status(), nothing
     offset != 0 && (f.currentOffset = offset)
     lines = String[]
-    st = XRootDStatus()
     while !eof(f)
         st, line = readline(f, size, 0, chunk)
-        isError(st) && break
+        # A failure part-way through is not a short file: a caller cannot tell
+        # the lines that were there from the ones that were not read.
+        isError(st) && return st, nothing
         push!(lines, line)
     end
-    return st, lines
+    return XRootDStatus(), lines
 end
 
 """
@@ -385,9 +442,7 @@ function pgwrite_once(f::File, offset::Int64, data::Vector{UInt8}, reqflags::UIn
     n = Int(s.pgdlen)
     n == 0 && return XRootDStatus(), UInt8[]
     if length(body) < Wire.STATUS_BODY_LEN + n
-        return XRootDStatus(
-            0x0001, 0x0000, 0, "pgwrite: truncated checksum-error trailer"
-        ),
+        return XRootDStatus(0x0001, 0x0000, 0, "pgwrite: truncated checksum-error trailer"),
         UInt8[]
     end
     return XRootDStatus(),

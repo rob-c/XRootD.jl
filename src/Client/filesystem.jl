@@ -4,13 +4,18 @@
 # per-request timeouts arrive with the resilience work (plan 05).
 
 """
-    FileSystem(url::String; insecure_tls::Bool=false)
+    FileSystem(url::String; insecure_tls::Bool=false, kwargs...)
 
 Handle for filesystem operations against an XRootD server, e.g.
-`FileSystem("root://localhost:1094")`. A `roots://` URL upgrades the
-connection to TLS. Connects lazily on first use and reconnects if the
-connection is lost. `insecure_tls` skips certificate-chain verification
+`FileSystem("root://localhost:1094")`. The URL grammar is
+`root://[user@]host[:port]` (`xroot://` is an accepted alias); a user named in
+the URL becomes the login account. A `roots://` URL upgrades the connection to
+TLS. Connects lazily on first use and reconnects if the connection is lost. `insecure_tls` skips certificate-chain verification
 (self-signed test servers only).
+
+Remaining keywords are credentials, forwarded to every connection this
+handle makes: `token`, `keytab`, `cert`/`key` (X.509), `x509`
+(see [`XRootD.Session.connect`](@ref)).
 """
 mutable struct FileSystem
     url::String
@@ -18,17 +23,18 @@ mutable struct FileSystem
     port::Int
     want_tls::Bool
     insecure_tls::Bool
+    creds::Dict{Symbol,Any}
     conn::Union{Session.Connection,Nothing}
 end
 
-function FileSystem(url::String, isServer::Bool=false; insecure_tls::Bool=false)
-    m = match(r"^(roots?)://([^/:@]+)(?::(\d+))?", url)
-    m === nothing && throw(ArgumentError("not a root:// URL: $(repr(url))"))
-    scheme = String(something(m.captures[1]))
-    host = String(something(m.captures[2]))
-    portstr = m.captures[3]
-    port = portstr === nothing ? 1094 : parse(Int, portstr)
-    return FileSystem(url, host, port, scheme == "roots", insecure_tls, nothing)
+function FileSystem(url::String, isServer::Bool=false; insecure_tls::Bool=false, kwargs...)
+    u = Session.parse_root_url(url)
+    creds = Dict{Symbol,Any}(kwargs)
+    # A user named in the URL is the login account; an explicit keyword wins.
+    isempty(u.username) || get!(creds, :username, u.username)
+    return FileSystem(
+        url, u.host, u.port, u.scheme == "roots", insecure_tls, creds, nothing
+    )
 end
 
 "Connect lazily; reconnect when the previous connection died."
@@ -36,7 +42,11 @@ function connection!(fs::FileSystem)
     conn = fs.conn
     if conn === nothing || !isopen(conn)
         conn = Session.connect(
-            fs.host, fs.port; want_tls=fs.want_tls, insecure_tls=fs.insecure_tls
+            fs.host,
+            fs.port;
+            want_tls=fs.want_tls,
+            insecure_tls=fs.insecure_tls,
+            fs.creds...,
         )
         fs.conn = conn
     end
@@ -102,11 +112,29 @@ function perform(fs::FileSystem, req::Wire.Request; max_hops::Int=8)
             hops += 1
             hops > max_hops &&
                 return XRootDStatus(hdr.status, 0, 0, "too many redirects"), body
-            r = Wire.decode_redirect(body)
+            r = try
+                Wire.decode_redirect(body)
+            catch err
+                # A redirect we cannot parse names no destination. Report it
+                # as a failed operation rather than letting the decode throw
+                # out of an API whose callers read statuses.
+                return XRootDStatus(
+                    0x0001,
+                    0x0000,
+                    0,
+                    "malformed kXR_redirect: $(sprint(showerror, err))",
+                ),
+                body
+            end
+            isempty(r.host) &&
+                return XRootDStatus(0x0001, 0x0000, 0, "kXR_redirect names no host"), body
             close(conn)
-            fs.host = r.host
-            fs.port = r.port > 0 ? Int(r.port) : fs.port
+            fs.host = Session.unbracket(r.host)
+            fs.port, fs.want_tls = redirect_endpoint(r, fs.port, fs.want_tls)
             fs.conn = nothing
+            # The redirector's opaque data is meant for the target — most
+            # often the token that makes the retried request acceptable there.
+            req = Wire.with_cgi(req, r.cgi)
             continue
         end
 
@@ -125,10 +153,46 @@ function perform(fs::FileSystem, req::Wire.Request; max_hops::Int=8)
     end
 end
 
+"""
+Where a `kXR_redirect` points, given the endpoint the client is on now.
+
+A negative port is how the protocol says "and speak TLS there": the target
+port is its magnitude (XRootD ≥ 5, which is also how a manager sends a client
+to a `roots://` data server). A zero port names no port, so the current one
+stands. TLS never goes back off — a client that asked for `roots://` is not
+downgraded because a redirector happened to send a positive port.
+"""
+function redirect_endpoint(r, port::Int, want_tls::Bool)
+    target = Int(r.port)
+    target == 0 && return port, want_tls
+    target < 0 && return -target, true
+    return target, want_tls
+end
+
 "Recognize the reader task's synthetic connection-lost error body."
 function is_transport_loss(body::AbstractVector{UInt8})
     length(body) < 4 && return false
     return occursin("lost", Wire.decode_error(body).message)
+end
+
+"""
+    decoded(f, st, body) -> (XRootDStatus, result | nothing)
+
+Decode a response body with `f`, reporting a malformed reply as an error
+status rather than an exception. A server's bytes are untrusted input and
+callers of this API read statuses: a listing with an unpaired stat line or a
+truncated stat must fail the operation, not the caller.
+"""
+function decoded(f::Function, st::XRootDStatus, body::AbstractVector{UInt8})
+    try
+        return st, f(body)
+    catch err
+        (err isa ArgumentError || err isa BoundsError) || rethrow()
+        return XRootDStatus(
+            Wire.kXR_error, 0x0000, 0, "malformed response: $(sprint(showerror, err))"
+        ),
+        nothing
+    end
 end
 
 """
@@ -149,7 +213,9 @@ Stat a file or directory. Returns `(status, StatInfo | nothing)`.
 function Base.stat(fs::FileSystem, path::String, timeout::UInt16=0x0000)
     st, body = perform(fs, Wire.StatRequest(path))
     isOK(st) || return st, nothing
-    return st, StatInfo(String(copy(body)))
+    return decoded(st, body) do b
+        return StatInfo(String(copy(b)))
+    end
 end
 
 """
@@ -161,8 +227,9 @@ List the locations of a file or directory (`flags` from `OpenFlags`, e.g.
 function locate(fs::FileSystem, path::String, flags::Integer, timeout::UInt16=0x0000)
     st, body = perform(fs, Wire.LocateRequest(path; options=UInt16(flags)))
     isOK(st) || return st, nothing
-    locs = [Location(t.address, t.node, t.access) for t in Wire.parse_locate(body)]
-    return st, locs
+    return decoded(st, body) do b
+        return [Location(t.address, t.node, t.access) for t in Wire.parse_locate(b)]
+    end
 end
 
 """
@@ -194,17 +261,20 @@ function Base.readdir(
     options = wants_stat ? Wire.kXR_dstat : 0x00
     st, body = perform(fs, Wire.DirlistRequest(path; options=options))
     isOK(st) || return st, nothing
-    entries = Wire.parse_dirlist(body).entries
-    join && (entries = joinpath.(Ref(path), entries))
-    sort && sort!(entries)
-    return st, entries
+    return decoded(st, body) do b
+        entries = Wire.parse_dirlist(b).entries
+        join && (entries = joinpath.(Ref(path), entries))
+        sort && sort!(entries)
+        return entries
+    end
 end
 
 "Directory listing with per-entry StatInfo (one round trip when the server honors dstat)."
 function dirlist_stat(fs::FileSystem, path::String)
     st, body = perform(fs, Wire.DirlistRequest(path; options=Wire.kXR_dstat))
     isOK(st) || return st, nothing, nothing
-    listing = Wire.parse_dirlist(body)
+    st, listing = decoded(Wire.parse_dirlist, st, body)
+    listing === nothing && return st, nothing, nothing
     if listing.stats !== nothing
         stats = [StatInfo_from_parts(s) for s in listing.stats]
         return st, listing.entries, stats
@@ -283,15 +353,19 @@ end
 
 """
     Base.mkdir(fs::FileSystem, path::String, mode::Integer=Access.None,
-               timeout::UInt16=0x0000)
+               timeout::UInt16=0x0000; mkpath::Bool=false)
 
-Create a directory (no parents; the server rejects missing intermediate
-directories). Returns `(status, nothing)`.
+Create a directory. Missing intermediate directories are rejected by the
+server unless `mkpath` is set (`kXR_mkdirpath`). Returns `(status, nothing)`.
 """
 function Base.mkdir(
-    fs::FileSystem, path::String, mode::Integer=Access.None, timeout::UInt16=0x0000
+    fs::FileSystem,
+    path::String,
+    mode::Integer=Access.None,
+    timeout::UInt16=0x0000;
+    mkpath::Bool=false,
 )
-    st, _ = perform(fs, Wire.MkdirRequest(path; mode=UInt16(mode)))
+    st, _ = perform(fs, Wire.MkdirRequest(path; mode=UInt16(mode), mkpath=mkpath))
     return st, nothing
 end
 
@@ -335,8 +409,10 @@ Get the server's protocol information. Returns
 function protocol(fs::FileSystem, timeout::UInt16=0x0000)
     st, body = perform(fs, Wire.ProtocolRequest())
     isOK(st) || return st, nothing
-    p = Wire.decode_protocol(body)
-    return st, ProtocolInfo(p.pval, p.flags)
+    return decoded(st, body) do b
+        p = Wire.decode_protocol(b)
+        return ProtocolInfo(p.pval, p.flags)
+    end
 end
 
 # ---- copy ----
@@ -348,7 +424,9 @@ function open_file(conn::Session.Connection, path::String, options::UInt16, mode
     hdr, body = Session.roundtrip(conn, Wire.OpenRequest(path; mode=mode, options=options))
     st = status_from(hdr, body)
     isOK(st) || return st, nothing
-    return st, Wire.decode_open(body).fhandle
+    return decoded(st, body) do b
+        return Wire.decode_open(b).fhandle
+    end
 end
 
 function close_file(conn::Session.Connection, fhandle::NTuple{4,UInt8})
@@ -405,6 +483,27 @@ end
 
 # ---- extended operations (plan 05) ----
 
+"An attribute-level `kXR_fattr` failure, which the request status reports as success."
+function fattr_error(name::AbstractString, rc::Integer)
+    return XRootDStatus(
+        Wire.kXR_error, UInt16(rc), 0, "attribute $(repr(String(name))): kXR error $(rc)"
+    )
+end
+
+"""
+    fattr_rc(st, body, name) -> XRootDStatus
+
+Promote the per-attribute status of a `kXR_fattr` Get/Set/Del reply into the
+operation status. The request-level status is `kXR_ok` even when the attribute
+itself failed (a missing name gives `kXR_AttrNotFound`), so ignoring the nvec
+`rc` would report a no-op as a success (libxrdc `fattr.c`).
+"""
+function fattr_rc(st::XRootDStatus, body::AbstractVector{UInt8}, name::AbstractString)
+    st, rc = decoded(Wire.parse_fattr_status, st, body)
+    rc === nothing && return st
+    return rc == 0 ? st : fattr_error(name, rc)
+end
+
 """
     getxattr(fs::FileSystem, path::String, name::String)
 
@@ -413,9 +512,11 @@ Read one extended attribute. Returns `(status, Vector{UInt8} | nothing)`.
 function getxattr(fs::FileSystem, path::String, name::String)
     st, body = perform(fs, Wire.FattrRequest(Wire.kXR_fattrGet, path; names=[name]))
     isOK(st) || return st, nothing
-    results = Wire.parse_fattr_get(body, 1)
-    isempty(results) && return st, nothing
-    return st, results[1].value
+    st = fattr_rc(st, body, name)
+    isOK(st) || return st, nothing
+    return decoded(st, body) do b
+        return Wire.parse_fattr_get(b, 1)[1].value
+    end
 end
 
 """
@@ -424,10 +525,11 @@ end
 Create or overwrite one extended attribute. Returns `(status, nothing)`.
 """
 function setxattr(fs::FileSystem, path::String, name::String, value::Vector{UInt8})
-    st, _ = perform(
+    st, body = perform(
         fs, Wire.FattrRequest(Wire.kXR_fattrSet, path; names=[name], values=[value])
     )
-    return st, nothing
+    isOK(st) || return st, nothing
+    return fattr_rc(st, body, name), nothing
 end
 
 """
@@ -447,8 +549,9 @@ end
 Delete one extended attribute. Returns `(status, nothing)`.
 """
 function removexattr(fs::FileSystem, path::String, name::String)
-    st, _ = perform(fs, Wire.FattrRequest(Wire.kXR_fattrDel, path; names=[name]))
-    return st, nothing
+    st, body = perform(fs, Wire.FattrRequest(Wire.kXR_fattrDel, path; names=[name]))
+    isOK(st) || return st, nothing
+    return fattr_rc(st, body, name), nothing
 end
 
 """
