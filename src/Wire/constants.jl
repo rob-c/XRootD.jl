@@ -65,7 +65,23 @@ const kXR_asynresp  = UInt32(5008)
 # ---- kXR_protocol response flags (server type + TLS negotiation) ----
 const kXR_haveTLS  = UInt32(0x80000000)  # server accepts in-protocol TLS upgrade
 const kXR_gotoTLS  = UInt32(0x40000000)  # client must upgrade immediately
+const kXR_tlsTPC   = UInt32(0x10000000)  # third-party copy must run over TLS
+const kXR_tlsSess  = UInt32(0x08000000)  # the session after login requires TLS
 const kXR_tlsLogin = UInt32(0x04000000)  # the login exchange requires TLS
+const kXR_tlsData  = UInt32(0x02000000)  # file data must move over TLS
+const kXR_tlsGPF   = UInt32(0x01000000)  # gpfile requests require TLS
+
+"""
+The `kXR_protocol` flags that oblige the client to upgrade during bring-up.
+
+`kXR_gotoTLS` is the order to upgrade now; `kXR_tlsLogin` and `kXR_tlsSess`
+name phases every session reaches — the login exchange and the session that
+follows it — so they amount to the same thing. The remaining TLS flags qualify
+particular requests instead (`kXR_tlsData` file data, `kXR_tlsGPF` gpfile,
+`kXR_tlsTPC` a third-party copy); a server that means to bind the whole
+session says so with `kXR_tlsSess`.
+"""
+const kXR_tlsDemands = kXR_gotoTLS | kXR_tlsLogin | kXR_tlsSess
 
 # ---- handshake / kXR_protocol ----
 const ROOTD_PQ             = UInt32(2012)        # 5th word of the client hello

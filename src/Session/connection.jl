@@ -50,19 +50,48 @@ function stall_deadline_ms()
 end
 
 """
+Default ceiling on the *cumulative* `kXR_wait` parking of one operation: 30
+minutes. A single wait is already clamped by [`Wire.wait_seconds`](@ref),
+but a server that answers every re-send with another wait would otherwise
+park a caller forever, so the advised delays are added up against this.
+"""
+const DEFAULT_MAX_WAIT_MS = 1_800_000
+
+"""
+Clamp on a single `kXR_waitresp` deferral, and the grace added to it before
+the deferred reply is called overdue (libxrdc `frame.c`: 570 s + 30 s).
+"""
+const WAITRESP_CAP_S = UInt32(570)
+const WAITRESP_GRACE_MS = 30_000
+
+"Resolve `XRDC_MAX_WAIT_MS` (milliseconds; 0 or unset = the default)."
+function max_wait_ms()
+    v = get(ENV, "XRDC_MAX_WAIT_MS", "")
+    isempty(v) && return DEFAULT_MAX_WAIT_MS
+    n = tryparse(Int, v)
+    return n === nothing || n <= 0 ? DEFAULT_MAX_WAIT_MS : n
+end
+
+"""
     connect(host, port; username = ENV["USER"], want_tls = false,
             insecure_tls = false) -> Connection
 
 Establish a session: TCP connect, then the 44-byte pipelined bring-up
 segment (20-byte handshake + `kXR_protocol`, exactly as libxrdc `conn.c`
 sends it); when the client requires TLS (`want_tls`, i.e. `roots://`) or
-the server demands it (`kXR_gotoTLS`/`kXR_tlsLogin` in the protocol reply),
+the server demands it ([`Wire.kXR_tlsDemands`](@ref) in the protocol reply),
 the socket upgrades to TLS before `kXR_login` (libxrdc `tls.c`). The login
 reply's security trailer then drives authentication
 ([`authenticate`](@ref)).
 
 `insecure_tls` skips certificate-chain verification (test servers with
 self-signed certificates only — never for production data).
+
+`cert`/`key` name an X.509 client credential to present during the TLS
+handshake; with neither given, [`discover_x509`](@ref) looks for a proxy in
+the usual places. `x509 = false` suppresses that discovery. `cafile` adds a
+CA bundle or hashed CA directory to the trusted roots, for a site CA that is
+neither in the Mozilla bundle nor under `\$X509_CERT_DIR`.
 """
 function connect(
     host::AbstractString,
@@ -72,10 +101,62 @@ function connect(
     insecure_tls::Bool=false,
     token::Union{AbstractString,Nothing}=nothing,
     keytab::Union{AbstractString,Nothing}=nothing,
+    cert::Union{AbstractString,Nothing}=nothing,
+    key::Union{AbstractString,Nothing}=nothing,
+    cafile::Union{AbstractString,Nothing}=nothing,
+    x509::Bool=true,
     keepalive_s::Real=0,
 )
     sock::IO = Sockets.connect(String(host), port)
+    try
+        return bring_up(
+            sock,
+            String(host),
+            Int(port);
+            username,
+            want_tls,
+            insecure_tls,
+            token,
+            keytab,
+            cert,
+            key,
+            cafile,
+            x509,
+            keepalive_s,
+        )
+    catch
+        # A bring-up that fails owns the socket it opened. Leaving it to the
+        # finalizer holds a half-open connection at the server — and a client
+        # that walks a redirect chain fails bring-up repeatedly by design.
+        try
+            close(sock)
+        catch
+            # already gone, which is the state we wanted
+        end
+        rethrow()
+    end
+end
 
+"""
+The bring-up itself, on an already-connected `sock`: handshake,
+`kXR_protocol`, the TLS decision, `kXR_login` and any authentication the
+login reply calls for. Returns the live [`Connection`](@ref).
+"""
+function bring_up(
+    sock::IO,
+    host::String,
+    port::Int;
+    username::AbstractString,
+    want_tls::Bool,
+    insecure_tls::Bool,
+    token::Union{AbstractString,Nothing},
+    keytab::Union{AbstractString,Nothing},
+    cert::Union{AbstractString,Nothing},
+    key::Union{AbstractString,Nothing},
+    cafile::Union{AbstractString,Nothing},
+    x509::Bool,
+    keepalive_s::Real,
+)
     # Bring-up is synchronous: the reader Task starts only once the session
     # is authenticated, so plain blocking reads are safe here.
     flags = if want_tls
@@ -90,7 +171,7 @@ function connect(
     p_hdr.status == Wire.kXR_ok || bringup_error("kXR_protocol", p_hdr)
     proto = Wire.decode_protocol(p_body)
 
-    server_demands = (proto.flags & (Wire.kXR_gotoTLS | Wire.kXR_tlsLogin)) != 0
+    server_demands = (proto.flags & Wire.kXR_tlsDemands) != 0
     if want_tls || server_demands
         if (proto.flags & Wire.kXR_haveTLS) == 0
             error(
@@ -98,7 +179,8 @@ function connect(
                 "(protocol flags 0x$(string(proto.flags; base=16)))",
             )
         end
-        sock = tls_upgrade(sock, String(host); insecure_tls)
+        creds = x509 ? discover_x509(; cert, key) : nothing
+        sock = tls_upgrade(sock, String(host); insecure_tls, creds, cafile)
     end
 
     write(sock, Wire.encode(Wire.LoginRequest(username), UInt16(2)))
@@ -161,17 +243,16 @@ end
 """
     connect(url::AbstractString; kwargs...) -> Connection
 
-Convenience: parse `root://host[:port]` (default port 1094) and connect;
-a `roots://` scheme forces TLS.
+Convenience: parse `root://[user@]host[:port]` ([`parse_root_url`](@ref),
+default port 1094) and connect; a `roots://` scheme forces TLS. A user named
+in the URL logs in as that account unless a `username` keyword says otherwise.
 """
 function connect(url::AbstractString; kwargs...)
-    m = match(r"^(roots?)://([^/:@]+)(?::(\d+))?", url)
-    m === nothing && throw(ArgumentError("not a root:// URL: $(repr(url))"))
-    scheme = String(something(m.captures[1]))
-    host = String(something(m.captures[2]))
-    portstr = m.captures[3]
-    port = portstr === nothing ? 1094 : parse(Int, portstr)
-    return connect(host, port; want_tls=(scheme == "roots"), kwargs...)
+    u = parse_root_url(url)
+    opts = Dict{Symbol,Any}(kwargs)
+    get!(opts, :want_tls, u.scheme == "roots")
+    isempty(u.username) || get!(opts, :username, u.username)
+    return connect(u.host, u.port; opts...)
 end
 
 function bringup_error(stage::String, hdr::Wire.ResponseHeader)
@@ -208,9 +289,23 @@ end
 """
 Upgrade a live socket to TLS (client mode) with SNI/hostname checking.
 Chain verification is on unless `insecure_tls` (self-signed test servers).
+
+`creds` presents an X.509 client certificate during the handshake — the
+identity an XRootD 5 server maps to a user when it authenticates over TLS.
+Presenting one is harmless when the server does not ask, so the default is
+whatever [`discover_x509`](@ref) finds. `cafile` names an extra CA bundle or
+hashed directory to trust.
 """
-function tls_upgrade(sock::IO, host::String; insecure_tls::Bool=false)
-    ssl = OpenSSL.SSLStream(sock)
+function tls_upgrade(
+    sock::IO,
+    host::String;
+    insecure_tls::Bool=false,
+    creds::Union{X509Credentials,Nothing}=nothing,
+    cafile::Union{AbstractString,Nothing}=nothing,
+)
+    ctx = client_ssl_context(; insecure_tls, creds)
+    cafile === nothing || OpenSSL.ca_chain!(ctx, String(cafile))
+    ssl = OpenSSL.SSLStream(ctx, sock)
     OpenSSL.hostname!(ssl, host)
     OpenSSL.connect(ssl; require_ssl_verification=(!insecure_tls))
     return ssl
@@ -332,11 +427,14 @@ The budget covers *every* frame of one logical operation, which is the point:
 a server that splits a read into many small frames cannot stay under a
 per-frame timeout indefinitely.
 """
-function arm_stall(conn::Connection, sid::UInt16, ch::Channel{Frame})
-    ms = conn.stall_deadline_ms
+function arm_stall(
+    conn::Connection, sid::UInt16, ch::Channel{Frame}; ms::Integer=conn.stall_deadline_ms
+)
     ms > 0 || return nothing
     return Timer(ms / 1000) do _
-        put!(ch, synthetic_error(sid, "operation exceeded the $(ms) ms stall deadline"))
+        return put!(
+            ch, synthetic_error(sid, "operation exceeded the $(ms) ms stall deadline")
+        )
     end
 end
 
@@ -355,7 +453,8 @@ length they asked for — see [`Wire.readv_reply_cap`](@ref) and
 [`Wire.pgread_reply_cap`](@ref) for the vector and paged forms.
 
 When `conn.stall_deadline_ms` is set the whole call is bounded by that
-absolute deadline ([`arm_stall`](@ref)).
+absolute deadline ([`arm_stall`](@ref)); repeated `kXR_wait` answers are
+bounded separately by [`max_wait_ms`](@ref).
 """
 function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
     conn.closed && return synthetic_error(0x0000, "connection already closed")
@@ -364,6 +463,9 @@ function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
     acc = UInt8[]
     cap = Int(maxbytes)
     stall = nothing
+    waited_ms = max_wait_ms()
+    wait_budget = waited_ms / 1000
+    waited = 0.0
     try
         # High-security servers require a kXR_sigver prefix on mutating ops;
         # it must share the write lock so it stays adjacent to its request.
@@ -393,18 +495,52 @@ function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
             elseif hdr.status == Wire.kXR_wait
                 # An explicit, in-band "retry in N seconds" is the server
                 # declaring a delay, not dribbling: restart the budget so the
-                # advised wait cannot itself trip the cutoff.
-                sleep(Wire.wait_seconds(body))
+                # advised wait cannot itself trip the cutoff. The delays are
+                # still summed — an endless stream of waits is a stall too.
+                secs = Wire.wait_seconds(body)
+                waited += secs
+                waited > wait_budget && return synthetic_error(
+                    sid,
+                    "operation parked for more than the $(waited_ms) ms kXR_wait budget",
+                )
+                sleep(secs)
                 send(conn, frame)
                 stall === nothing || close(stall)
                 stall = arm_stall(conn, sid, ch)
+            elseif hdr.status == Wire.kXR_waitresp
+                # "The answer is coming later": the server has accepted the
+                # request and will deliver the reply unsolicited, as a
+                # kXR_attn(kXR_asynresp) on this same streamid (libxrdc
+                # aio_io.c). Nothing is re-sent — a deferral is not a retry —
+                # but the stall deadline is re-armed for the advised delay,
+                # since otherwise the wait the server asked for would itself
+                # look like a stall. A TPC rendezvous is deferred this way.
+                secs = Wire.wait_seconds(body; cap=WAITRESP_CAP_S)
+                waited += secs
+                waited > wait_budget && return synthetic_error(
+                    sid,
+                    "deferred reply did not arrive within the $(waited_ms) ms " *
+                    "kXR_wait budget",
+                )
+                stall === nothing || close(stall)
+                deadline_ms = conn.stall_deadline_ms
+                stall = if deadline_ms > 0
+                    arm_stall(
+                        conn,
+                        sid,
+                        ch;
+                        ms=max(deadline_ms, round(Int, secs * 1000) + WAITRESP_GRACE_MS),
+                    )
+                else
+                    nothing
+                end
             elseif hdr.status == Wire.kXR_ok
                 # The cap applies to data-bearing statuses only: an error
                 # body is a message, and truncating one would hide the very
                 # failure the caller needs to see.
                 over_cap(cap, length(acc), length(body)) &&
                     return synthetic_error(sid, overrun_message(req, cap))
-                isempty(acc) || (append!(acc, body); body = acc)
+                isempty(acc) || (append!(acc, body); body=acc)
                 return hdr, body
             else
                 return hdr, body

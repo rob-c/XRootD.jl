@@ -15,10 +15,13 @@ module Session
 
 using Sockets: Sockets, TCPSocket
 using OpenSSL: OpenSSL
+using OpenSSL_jll: libssl
 using SHA: hmac_sha256
 using ..Wire
 
 include("blowfish.jl")
+include("url.jl")
+include("x509.jl")
 include("connection.jl")
 include("sss.jl")
 include("auth.jl")
