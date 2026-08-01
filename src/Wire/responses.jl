@@ -38,18 +38,25 @@ end
 
 Decode a `kXR_redirect` body: `port[4]` + `host[?cgi]`. Any CGI opaque
 after `?` is split off into `cgi` (empty when absent).
+
+The host field ends at the first NUL, CR or LF — a redirector that terminates
+it with a line ending names a host, not a host plus whitespace — and the
+opaque's own leading separators are dropped: EOS hands its open capability
+over as `?&cap.sym=…`, and the `&` is a separator, not part of the token.
 """
 function decode_redirect(body::AbstractVector{UInt8})
     if length(body) < 4
         throw(ArgumentError("kXR_redirect body needs ≥ 4 bytes, got $(length(body))"))
     end
     port = reinterpret(Int32, get_u32(body, 1))
-    target = get_bounded_string(body, 5, length(body) - 4)
+    field = get_bounded_string(body, 5, length(body) - 4)
+    eol = findfirst(c -> c == '\r' || c == '\n', field)
+    target = eol === nothing ? field : field[1:prevind(field, eol)]
     host, cgi = let i = findfirst('?', target)
         if i === nothing
             (target, "")
         else
-            (target[1:prevind(target, i)], target[nextind(target, i):end])
+            (target[1:prevind(target, i)], lstrip(target[nextind(target, i):end], ('?', '&')))
         end
     end
     return (; port, host=String(host), cgi=String(cgi))
@@ -364,6 +371,23 @@ function parse_fattr_get(body::AbstractVector{UInt8}, nattr::Integer)
         push!(out, (; rc=rcs[i], value=val))
     end
     return out
+end
+
+"""
+    parse_fattr_status(body) -> UInt16
+
+The per-attribute status code of a `kXR_fattr` Get/Set/Del reply:
+`[u8 errcount][u8 numattr]` then the nvec entry `[int16 rc][name\\0]`. A
+non-zero `rc` is a kXR error code for the attribute itself
+(`kXR_AttrNotFound`, ...) and is NOT reflected in the request-level status,
+so a client that ignores it reports a failed attribute operation as success
+(libxrdc `fattr.c`).
+"""
+function parse_fattr_status(body::AbstractVector{UInt8})
+    if length(body) < 4 || body[2] < 0x01
+        throw(ArgumentError("malformed kXR_fattr reply ($(length(body)) bytes)"))
+    end
+    return get_u16(body, 3)
 end
 
 """

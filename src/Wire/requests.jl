@@ -890,3 +890,46 @@ function body!(frame::Vector{UInt8}, r::PrepareRequest)
 end
 
 payload(r::PrepareRequest) = codeunits(join(r.paths, "\n"))
+
+"""
+    merge_cgi(path, cgi) -> String
+
+Attach opaque `cgi` to `path`, picking the separator the path needs: `?`
+when it carries none yet, `&` when it already does. An empty `cgi` leaves
+the path alone.
+"""
+function merge_cgi(path::AbstractString, cgi::AbstractString)
+    isempty(cgi) && return String(path)
+    return String(path) * (occursin('?', path) ? "&" : "?") * String(cgi)
+end
+
+"""
+    with_cgi(r::Request, cgi::AbstractString) -> Request
+
+Return `r` with `cgi` merged onto its path. A redirector answers with opaque
+data of its own (the `kXR_redirect` body is `port` + `host[?cgi]`) and the
+client has to present it to the target — that is how a manager hands the
+data server it picked a one-shot token. The caller's own CGI is kept and the
+redirector's appended, because both sides put meaning in it.
+
+Requests that name no path, or two, are returned unchanged.
+"""
+with_cgi(r::Request, ::AbstractString) = r
+
+for T in (
+    ChmodRequest,
+    DirlistRequest,
+    FattrRequest,
+    LocateRequest,
+    MkdirRequest,
+    OpenRequest,
+    ReadlinkRequest,
+    RmRequest,
+    RmdirRequest,
+    SetattrRequest,
+    StatRequest,
+    TruncateRequest,
+)
+    args = [f === :path ? :(merge_cgi(r.path, cgi)) : :(r.$f) for f in fieldnames(T)]
+    @eval with_cgi(r::$T, cgi::AbstractString) = isempty(cgi) ? r : $T($(args...))
+end
