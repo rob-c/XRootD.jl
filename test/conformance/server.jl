@@ -32,6 +32,7 @@ Base.@kwdef mutable struct ConfServer
     data::Vector{UInt8} = UInt8[]
     violations::Vector{String} = String[]
     ops::Vector{UInt16} = UInt16[]
+    logins::Vector{String} = String[]
     # response shaping
     read_chunk::Int = 0         # >0: split read replies into kXR_oksofar chunks
     wait_once::Bool = false     # answer the next read with kXR_wait 1, then normally
@@ -46,6 +47,7 @@ Base.@kwdef mutable struct ConfServer
     drop_readv::Set{Int} = Set{Int}()   # readv segments at these offsets are omitted
     bad_once::Set{Int} = Set{Int}()     # pgwrite pages reported corrupt on first try
     bad_always::Set{Int} = Set{Int}()   # pgwrite pages reported corrupt forever
+    fail_write::Bool = false
     fail_sync::Bool = false
     fail_close::Bool = false
 end
@@ -57,6 +59,7 @@ flag!(srv::ConfServer, msg::AbstractString) = push!(srv.violations, String(msg))
 function conf_reset!(srv::ConfServer)
     empty!(srv.violations)
     empty!(srv.ops)
+    empty!(srv.logins)
     srv.read_chunk = 0
     srv.wait_once = false
     srv.async_read = false
@@ -70,6 +73,7 @@ function conf_reset!(srv::ConfServer)
     empty!(srv.drop_readv)
     empty!(srv.bad_once)
     empty!(srv.bad_always)
+    srv.fail_write = false
     srv.fail_sync = false
     srv.fail_close = false
     return srv
@@ -90,7 +94,9 @@ function cs_hdr(sid::UInt16, status::UInt16, dlen::Integer)
     return h
 end
 
-cs_ok(sock, sid, body=UInt8[]) = write(sock, vcat(cs_hdr(sid, Wire.kXR_ok, length(body)), body))
+function cs_ok(sock, sid, body=UInt8[])
+    return write(sock, vcat(cs_hdr(sid, Wire.kXR_ok, length(body)), body))
+end
 
 function cs_error(sock, sid, errnum, msg)
     body = vcat(cs_be32(errnum), Vector{UInt8}(codeunits(msg)))
@@ -155,7 +161,14 @@ end
 
 # ---- per-request handlers ----
 
-function serve_bringup(srv::ConfServer, sock)
+"""
+Handshake, `kXR_protocol` and `kXR_login`, checked byte for byte. `srv` is any
+conformance server with `violations` and `logins` lists — this file's, the
+namespace server's and the redirector's alike, which bring a connection up
+identically. The username every connection logs in as is recorded, so a test
+can assert which identity was presented and to whom.
+"""
+function serve_bringup(srv, sock)
     hello = read(sock, 20)
     length(hello) == 20 || throw(EOFError())
     hello[1:12] == zeros(UInt8, 12) || flag!(srv, "handshake: leading words not zero")
@@ -163,10 +176,15 @@ function serve_bringup(srv::ConfServer, sock)
     Wire.get_u32(hello, 17) == Wire.ROOTD_PQ || flag!(srv, "handshake: bad protocol token")
     write(sock, vcat(cs_hdr(0x0000, Wire.kXR_ok, 8), cs_be32(0x310), cs_be32(1)))
     pf, _ = cs_take(sock)
-    Wire.get_u16(pf, 3) == Wire.kXR_protocol || flag!(srv, "bring-up: expected kXR_protocol")
-    write(sock, vcat(cs_hdr(Wire.get_u16(pf, 1), Wire.kXR_ok, 8), cs_be32(0x520), cs_be32(1)))
+    Wire.get_u16(pf, 3) == Wire.kXR_protocol ||
+        flag!(srv, "bring-up: expected kXR_protocol")
+    write(
+        sock, vcat(cs_hdr(Wire.get_u16(pf, 1), Wire.kXR_ok, 8), cs_be32(0x520), cs_be32(1))
+    )
     lf, _ = cs_take(sock)
     Wire.get_u16(lf, 3) == Wire.kXR_login || flag!(srv, "bring-up: expected kXR_login")
+    # The username sits in the 8-byte NUL-padded header field, not the body.
+    push!(srv.logins, String(rstrip(String(copy(lf[9:16])), '\0')))
     write(sock, vcat(cs_hdr(Wire.get_u16(lf, 1), Wire.kXR_ok, 16), UInt8.(1:16)))
     return nothing
 end
@@ -216,6 +234,7 @@ function serve_write(srv::ConfServer, sock, sid, frame, payload)
     check_fhandle(srv, frame, "kXR_write")
     offset = cs_i64(frame, 9)
     offset < 0 && flag!(srv, "kXR_write: negative offset $offset")
+    srv.fail_write && return cs_error(sock, sid, 3016, "write failed")
     apply_write!(srv, offset, payload)
     return cs_ok(sock, sid)
 end
@@ -287,7 +306,12 @@ function serve_pgread(srv::ConfServer, sock, sid, frame)
     if srv.short_pgdlen
         srv.short_pgdlen = false
         # a page unit cut off mid-CRC: the client must refuse, not guess
-        return write(sock, cs_status(sid, Wire.kXR_pgread, Wire.kXR_FinalResult, offset, UInt8[0x00, 0x00]))
+        return write(
+            sock,
+            cs_status(
+                sid, Wire.kXR_pgread, Wire.kXR_FinalResult, offset, UInt8[0x00, 0x00]
+            ),
+        )
     end
     # one status frame per page unit, the last one Final
     pos, pgoff = 0, offset
@@ -345,8 +369,12 @@ function serve_pgwrite(srv::ConfServer, sock, sid, frame, payload)
     retry = (frame[18] & Wire.kXR_pgRetry) != 0
     offsets = pgwrite_pages!(srv, offset, payload)
     offsets === nothing && return cs_error(sock, sid, 3000, "bad page payload")
-    retry && length(offsets) > 1 && flag!(srv, "kXR_pgRetry resent $(length(offsets)) pages")
-    retry && offset % CONF_PAGE != 0 && offset != 0 &&
+    retry &&
+        length(offsets) > 1 &&
+        flag!(srv, "kXR_pgRetry resent $(length(offsets)) pages")
+    retry &&
+        offset % CONF_PAGE != 0 &&
+        offset != 0 &&
         flag!(srv, "kXR_pgRetry offset $offset is not page aligned")
     bad = Int[]
     for off in offsets
@@ -362,7 +390,9 @@ function serve_pgwrite(srv::ConfServer, sock, sid, frame, payload)
     for off in bad
         append!(trailer, cs_be64(off))
     end
-    return write(sock, cs_status(sid, Wire.kXR_pgwrite, Wire.kXR_FinalResult, offset, trailer))
+    return write(
+        sock, cs_status(sid, Wire.kXR_pgwrite, Wire.kXR_FinalResult, offset, trailer)
+    )
 end
 
 function serve_conn(srv::ConfServer, sock)
@@ -405,7 +435,11 @@ function serve_conn(srv::ConfServer, sock)
                 srv.fail_sync ? cs_error(sock, sid, 3016, "sync failed") : cs_ok(sock, sid)
             elseif rid == Wire.kXR_close
                 check_fhandle(srv, frame, "kXR_close")
-                srv.fail_close ? cs_error(sock, sid, 3016, "close failed") : cs_ok(sock, sid)
+                if srv.fail_close
+                    cs_error(sock, sid, 3016, "close failed")
+                else
+                    cs_ok(sock, sid)
+                end
             elseif rid == Wire.kXR_ping
                 cs_ok(sock, sid)
             else

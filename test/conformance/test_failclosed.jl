@@ -5,7 +5,14 @@
 
 using XRootD.XrdCl
 using XRootD.XrdCl: sync, readv, pgread, pgwrite
-using XRootD.Storage: storage_for, storage_read, storage_write
+using XRootD.Storage: storage_for, storage_read, storage_write, storage_copy
+
+"A source that fails part-way through, the way a dying pipe does."
+struct ExplodingIO <: IO end
+
+function Base.readbytes!(::ExplodingIO, ::Vector{UInt8}, ::Integer)
+    return throw(Base.IOError("read: connection reset by peer (ECONNRESET)", -104))
+end
 
 @testset "conformance: fail-closed against a misbehaving server" begin
     srv, port = start_conf_server(CONF_CONTENT)
@@ -138,7 +145,29 @@ using XRootD.Storage: storage_for, storage_read, storage_write
         @test storage_write(b, IOBuffer(payload)) == :error
         wsrv.fail_close = false
 
+        # A refused kXR_write stops the upload there and then: neither the
+        # sync nor a second write is attempted after it.
+        wsrv.fail_write = true
+        empty!(wsrv.ops)
+        @test storage_write(b, IOBuffer(payload)) == :error
+        @test count(==("kXR_write"), op_names(wsrv)) == 1
+        @test !("kXR_sync" in op_names(wsrv))
+        wsrv.fail_write = false
+
+        # A source that fails mid-stream is a failed upload, not an exception
+        # escaping into the caller — and the handle is still closed.
+        empty!(wsrv.ops)
+        @test storage_write(b, ExplodingIO()) == :error
+        @test "kXR_close" in op_names(wsrv)
+
         @test storage_write(b, IOBuffer(payload)) == :ok
         @test isempty(wsrv.violations)
+    end
+
+    @testset "an xroot pair has no server-side copy" begin
+        # Copying between two xroot endpoints is a third-party copy, not a
+        # namespace operation; the backend says so instead of streaming.
+        b = storage_for("root://127.0.0.1:$port//conf")
+        @test storage_copy(b, "root://127.0.0.1:$port//other") == :unsupported
     end
 end

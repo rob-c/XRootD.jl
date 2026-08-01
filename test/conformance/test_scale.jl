@@ -56,8 +56,11 @@ const SCALE_LENGTHS = [0, 1, 7, 4096, 5000, 10_000]
         f = conf_file(wport)
         # Bases are multiples of 4 KiB so each case keeps its offset's phase
         # within the page grid, and far enough apart that they cannot overlap.
-        for (i, (offset, len)) in
-            enumerate(Iterators.product([0, 1, 4095, 4096, 4097, 8191], [1, 7, 4095, 4096, 4097, 9000]))
+        for (i, (offset, len)) in enumerate(
+            Iterators.product(
+                [0, 1, 4095, 4096, 4097, 8191], [1, 7, 4095, 4096, 4097, 9000]
+            ),
+        )
             base = (i - 1) * 131_072 + offset
             payload = CONF_CONTENT[1:len]
             st, _ = pgwrite(f, payload, base)
@@ -86,7 +89,9 @@ const SCALE_LENGTHS = [0, 1, 7, 4096, 5000, 10_000]
         wsrv, wport = start_conf_server()
         f = conf_file(wport)
         for nseg in [1, 2, 16, 256, Wire.VEC_MAXSEGS]
-            segs = [(Int64((i - 1) * 32), UInt8[(nseg + i) % 256 for _ in 1:16]) for i in 1:nseg]
+            segs = [
+                (Int64((i - 1) * 32), UInt8[(nseg + i) % 256 for _ in 1:16]) for i in 1:nseg
+            ]
             st, _ = writev(f, segs)
             @test isOK(st)
             @test all(wsrv.data[(s[1] + 1):(s[1] + 16)] == s[2] for s in segs)
