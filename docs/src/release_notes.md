@@ -10,17 +10,23 @@
 - Layered architecture: `Wire` (codecs) → `Session` (connections, TLS, auth,
   multiplexing, resilience) → `XrdCl` (public API) → `Storage` (multi-backend
   dispatch) → `Tools` (copy engine + CLIs).
-- In-protocol TLS via `roots://`.
-- Authentication: unix, WLCG bearer tokens (ztn), and sss shared-secret
-  (pure-Julia Blowfish); `kXR_sigver` request signing for high-security
-  servers.
+- In-protocol TLS via `roots://`, or on the server's demand (`kXR_gotoTLS`,
+  `kXR_tlsLogin`, `kXR_tlsSess`); a demand the server cannot honour fails the
+  session rather than falling back to cleartext.
+- Authentication: unix, WLCG bearer tokens (ztn), sss shared-secret
+  (pure-Julia Blowfish), and X.509 client certificates over TLS (grid proxy
+  discovery, `roots://` and `https://`/`davs://`); `kXR_sigver` request
+  signing for high-security servers.
 - New operations: `sync`, `readv`, `writev`, `pgread`/`pgwrite` (per-page
   CRC32c), `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statvfs`,
   `checksum`, `prepare`, `symlink`/`hardlink`/`readlink`.
-- Resilience: redirect following, reconnect-with-replay for idempotent
-  operations, and idle keepalive.
+- Resilience: redirect following (including a negative port, which names a
+  TLS endpoint), reconnect-with-replay for idempotent operations, and idle
+  keepalive.
 - Web backends: `http(s)://`, `dav(s)://` (WebDAV), and `s3(s)://` (AWS
-  Signature v4) through a `Storage` abstraction.
+  Signature v4) through a `Storage` abstraction; an S3 `endpoint` may name its
+  own scheme, so an S3-compatible service on a private network can be reached
+  over plain HTTP.
 - `Tools`: a backend-agnostic copy engine and Julia equivalents of `xrdcp`,
   `xrdfs`, `xrdadler32`, `xrdcrc32c`, `xrdcrc64`, and `xrdckverify`
   (`bin/*.jl`), verified byte-for-byte against the reference clients.
