@@ -140,6 +140,35 @@ end
         @test attempts[] >= 2
     end
 
+    @testset "a request that cannot even be sent is replayed" begin
+        # The socket looks open and the write fails anyway — a peer that went
+        # away without the FIN arriving. An idempotent operation reconnects
+        # and replays; anything else fails there, because a request that may
+        # already have been executed must not be repeated.
+        port = start_stat_server()
+        fs = FileSystem("root://127.0.0.1:$port")
+        fs.conn = dead_connection()
+        st, si = stat(fs, "/x")
+        @test isOK(st)
+        @test si.size == 99
+        @test fs.conn !== nothing
+
+        dead = FileSystem("root://127.0.0.1:1")
+        dead.conn = dead_connection()
+        st, _ = rm(dead, "/x")
+        @test isError(st)
+        @test occursin("EPIPE", st.message) || occursin("IOError", st.message)
+
+        # With the patience window shut, even an idempotent operation reports
+        # the loss instead of retrying.
+        withenv("XRDC_MAX_STALL_MS" => "0") do
+            gone = FileSystem("root://127.0.0.1:1")
+            gone.conn = dead_connection()
+            st, _ = stat(gone, "/x")
+            @test isError(st)
+        end
+    end
+
     @testset "idle keepalive pings" begin
         port, pings = start_ping_counting_server()
         conn = Session.connect("127.0.0.1", port; keepalive_s=0.3)

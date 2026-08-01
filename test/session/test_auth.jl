@@ -70,6 +70,20 @@ end
         @test got == ct
     end
 
+    @testset "the π-derived tables are Schneier's constants" begin
+        # The P-array and S-boxes are computed from big(π) rather than
+        # embedded as 1042 magic numbers; the derivation has to reproduce the
+        # published initialization values exactly.
+        words = Blowfish._pi_words()
+        @test length(words) == 18 + 4 * 256
+        @test words[1:4] == UInt32[0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]
+        @test Blowfish.P0 == words[1:18]
+        @test Blowfish.P0[18] == 0x8979fb1b
+        @test Blowfish.S0[1][1] == 0xd1310ba6
+        @test Blowfish.S0[4][256] == 0x3ac372e6
+        @test all(length(s) == 256 for s in Blowfish.S0)
+    end
+
     @testset "CFB64 length preserved" begin
         ctx = Blowfish.Context(UInt8[1, 2, 3, 4, 5, 6, 7, 8])
         data = rand(UInt8, 45)   # not a multiple of 8
@@ -118,6 +132,95 @@ end
                 0xff,
             ]
         end
+    end
+
+    @testset "keytab entries a client cannot use" begin
+        mktempdir() do dir
+            # A version tag that is neither 0 nor 1 is a format this client does
+            # not know; a line without a key has nothing to sign with.
+            path = joinpath(dir, "odd.keytab")
+            write(
+                path,
+                """
+                2 N:1 k:00112233445566778899aabbccddeeff
+                0 N:2 u:nokey
+                0 N:3 k:aabb # trailing comment ignored
+                0 N:4 k:ccdd e:99999999999
+                """,
+            )
+            keys = Session.read_keytab(path)
+            @test [k.id for k in keys] == [3, 4]
+            @test keys[1].key == UInt8[0xaa, 0xbb]
+
+            # An entry with no id at all still has a key, and the id it gets is
+            # the "unset" one the server treats as a wildcard.
+            path = joinpath(dir, "noid.keytab")
+            write(path, "1 k:0011\n")
+            @test only(Session.read_keytab(path)).id == -1
+        end
+    end
+
+    @testset "where the keytab is looked for" begin
+        # libxrdc reads XrdSecSSSKT first, then the historical XrdSecsssKT
+        # spelling, then falls back to the user's own copy.
+        withenv(
+            "XrdSecSSSKT" => "/one/kt", "XrdSecsssKT" => "/two/kt", "HOME" => "/home/u"
+        ) do
+            @test Session.default_keytab_path() == "/one/kt"
+        end
+        withenv("XrdSecSSSKT" => nothing, "XrdSecsssKT" => "/two/kt") do
+            @test Session.default_keytab_path() == "/two/kt"
+        end
+        withenv("XrdSecSSSKT" => nothing, "XrdSecsssKT" => nothing, "HOME" => "/home/u") do
+            @test Session.default_keytab_path() == "/home/u/.xrd/sss.keytab"
+        end
+    end
+
+    @testset "a credential is only minted from a usable keytab" begin
+        # No keytab, an unreadable one, and one with no usable entry all mean
+        # the same thing to the caller: sss is not available, try something else.
+        mktempdir() do dir
+            @test Session.sss_credential(; keytab=joinpath(dir, "absent")) === nothing
+
+            empty_kt = joinpath(dir, "empty.keytab")
+            write(empty_kt, "# nothing but a comment\n")
+            @test Session.sss_credential(; keytab=empty_kt) === nothing
+
+            unreadable = joinpath(dir, "unreadable.keytab")
+            write(unreadable, "0 N:1 k:00112233\n")
+            chmod(unreadable, 0o000)
+            # Root defeats the permission bits, so assert this only where the
+            # file really cannot be opened.
+            denied = try
+                read(unreadable)
+                false
+            catch
+                true
+            end
+            denied && @test Session.sss_credential(; keytab=unreadable) === nothing
+            chmod(unreadable, 0o600)
+
+            good = joinpath(dir, "good.keytab")
+            write(good, "0 N:77 k:00112233445566778899aabbccddeeff\n")
+            cred = Session.sss_credential(; keytab=good, username="alice")
+            @test cred !== nothing
+            @test cred[1:4] == UInt8['s', 's', 's', 0x00]
+            @test Wire.get_u64(cred, 9) == 77
+        end
+    end
+
+    @testset "the identity an sss credential carries" begin
+        # An empty username is not a credential for nobody; sss_credential.c
+        # substitutes "xrd", and so does the environment lookup.
+        withenv("USER" => nothing) do
+            @test Session.local_user() == "xrd"
+        end
+        withenv("USER" => "alice") do
+            @test Session.local_user() == "alice"
+        end
+        key = Session.SSSKey(Int64(1), collect(0x01:0x10))
+        @test length(Session.build_sss_credential(key, "")) ==
+            length(Session.build_sss_credential(key, "xrd"))
     end
 
     @testset "credential blob shape and decrypt round trip" begin

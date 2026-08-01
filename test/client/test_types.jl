@@ -13,6 +13,14 @@ using XRootD.XrdCl: StatInfo, Location, ProtocolInfo
         @test !isOK(bad)
         s = sprint(show, bad)
         @test occursin("ERROR", s) && occursin("No such file", s)
+
+        # The one-argument form is the bare status word: no code, no message.
+        only_status = XRootDStatus(0x0003)
+        @test isError(only_status)
+        @test only_status.code == 0x0000
+        @test only_status.errNo == 0
+        @test only_status.message == ""
+        @test isOK(XRootDStatus(0x0000))
     end
 
     @testset "StatInfo basic + extended" begin

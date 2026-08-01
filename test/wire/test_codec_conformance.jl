@@ -162,9 +162,14 @@ const SWEEP_LENGTHS = [1, 2, 7, 4095, 4096, 4097, 8192, 9000]
     @testset "pgwrite CSE trailers round trip for any page count" begin
         for k in 0:5
             offsets = Int64[4096 * i for i in 0:(k - 1)]
-            trailer = vcat(zeros(UInt8, Wire.PGW_CSE_HDRLEN),
-                reduce(vcat, (Wire.set_u64!(zeros(UInt8, 8), 1, UInt64(o)) for o in offsets);
-                    init=UInt8[]))
+            trailer = vcat(
+                zeros(UInt8, Wire.PGW_CSE_HDRLEN),
+                reduce(
+                    vcat,
+                    (Wire.set_u64!(zeros(UInt8, 8), 1, UInt64(o)) for o in offsets);
+                    init=UInt8[],
+                ),
+            )
             @test parse_pgwrite_cse(trailer) == offsets
         end
         # anything that is not header + whole 8-byte offsets is malformed

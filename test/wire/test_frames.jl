@@ -44,6 +44,10 @@ Wire.payload(::FakePayloadRequest) = codeunits("/tmp")
         @test length(frame) == REQUEST_HDRLEN + 4
         @test frame[21:24] == UInt8[0x00, 0x00, 0x00, 0x04]   # dlen = 4
         @test frame[25:28] == codeunits("/tmp")               # no trailing NUL
+
+        # A stream id may be given as any integer; it is the UInt16 on the wire.
+        @test encode(FakeRequest(), 3) == encode(FakeRequest(), UInt16(3))
+        @test_throws InexactError encode(FakeRequest(), 65536)
     end
 
     @testset "response header decode" begin

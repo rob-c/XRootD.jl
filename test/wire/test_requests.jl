@@ -226,9 +226,7 @@ using CRC32c: crc32c
     @testset "vector limits are enforced at construction" begin
         seg(off, len) = (; fhandle=fh, offset=Int64(off), rlen=Int32(len))
         @test_throws ArgumentError ReadVRequest(typeof(seg(0, 1))[])
-        @test_throws ArgumentError ReadVRequest([
-            seg(i, 1) for i in 0:(Wire.VEC_MAXSEGS)
-        ])
+        @test_throws ArgumentError ReadVRequest([seg(i, 1) for i in 0:(Wire.VEC_MAXSEGS)])
         @test_throws ArgumentError ReadVRequest([seg(0, -1)])
         @test_throws ArgumentError ReadVRequest([
             seg(0, Wire.VEC_MAXBYTES ÷ 2 + 1), seg(1 << 30, Wire.VEC_MAXBYTES ÷ 2 + 1)
@@ -343,4 +341,55 @@ using XRootD.Wire:
         @test p[5] == kXR_stage
         @test String(p[25:end]) == "/a\n/b"
     end
+end
+
+@testset "opaque data can be merged onto a request's path" begin
+    # A redirector's CGI has to reach the destination on the retried
+    # request, and the caller's own CGI has to survive the merge.
+    @test Wire.merge_cgi("/f", "a=1") == "/f?a=1"
+    @test Wire.merge_cgi("/f?mine=1", "a=1") == "/f?mine=1&a=1"
+    @test Wire.merge_cgi("/f", "") == "/f"
+
+    @test Wire.with_cgi(StatRequest("/f"), "a=1").path == "/f?a=1"
+    @test Wire.with_cgi(OpenRequest("/f?m=1"; options=kXR_open_read), "a=1").path ==
+        "/f?m=1&a=1"
+    @test Wire.with_cgi(MkdirRequest("/f"; mkpath=true), "a=1").mkpath
+    @test Wire.with_cgi(TruncateRequest("/f", Int64(9)), "a=1").size == 9
+    @test Wire.with_cgi(RmRequest("/f"), "").path == "/f"
+
+    # A request that names no path is handed back untouched — there is
+    # nowhere to put the opaque data and inventing one would be wrong.
+    @test Wire.with_cgi(PingRequest(), "a=1") isa PingRequest
+    @test Wire.with_cgi(MvRequest("/a", "/b"), "a=1").src == "/a"
+end
+
+@testset "a path need not already be a String" begin
+    # Paths arrive as views far more often than as String: splitting a
+    # directory listing, slicing a URL, iterating `eachsplit`. Every request
+    # that names one accepts any AbstractString and stores a String, so the
+    # frame is byte-identical to the one built from a String.
+    parts = split("/store/data /store/temp", ' ')     # SubString{String}
+    src, dst = parts[1], parts[2]
+    @test src isa SubString
+
+    @test encode(RmRequest(src), UInt16(1)) == encode(RmRequest("/store/data"), UInt16(1))
+    @test encode(RmdirRequest(src), UInt16(1)) ==
+        encode(RmdirRequest("/store/data"), UInt16(1))
+    @test encode(MvRequest(src, dst), UInt16(1)) ==
+        encode(MvRequest("/store/data", "/store/temp"), UInt16(1))
+    @test encode(ChmodRequest(src, 0o755), UInt16(1)) ==
+        encode(ChmodRequest("/store/data", 0o755), UInt16(1))
+    @test encode(SymlinkRequest(src, dst), UInt16(1)) ==
+        encode(SymlinkRequest("/store/data", "/store/temp"), UInt16(1))
+    @test encode(LinkRequest(src, dst), UInt16(1)) ==
+        encode(LinkRequest("/store/data", "/store/temp"), UInt16(1))
+    @test encode(ReadlinkRequest(src), UInt16(1)) ==
+        encode(ReadlinkRequest("/store/data"), UInt16(1))
+
+    args = split("stats /store", ' ')[2]
+    @test encode(QueryRequest(kXR_QStats, args), UInt16(1)) ==
+        encode(QueryRequest(kXR_QStats, "/store"), UInt16(1))
+
+    @test RmRequest(src).path isa String
+    @test MvRequest(src, dst).dst isa String
 end

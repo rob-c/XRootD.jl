@@ -150,6 +150,83 @@ function serve_client(sock)
     return nothing
 end
 
+"""
+Serve a bring-up that fails at `stage` (`:handshake`, `:protocol` or
+`:login`): every earlier step succeeds and that one answers `kXR_error`.
+"""
+function serve_bad_bringup(sock, stage::Symbol)
+    refuse(sid) =
+        let body = vcat(be32(3010), Vector{UInt8}(codeunits("go away")))
+            vcat(resp_hdr(sid, Wire.kXR_error, length(body)), body)
+        end
+    read(sock, 20)                                        # client hello
+    stage === :handshake && return write(sock, refuse(0x0000))
+    write(sock, vcat(resp_hdr(0x0000, Wire.kXR_ok, 8), be32(0x310), be32(1)))
+    preq, _ = read_request(sock)
+    stage === :protocol && return write(sock, refuse(req_sid(preq)))
+    write(sock, vcat(resp_hdr(req_sid(preq), Wire.kXR_ok, 8), be32(0x520), be32(1)))
+    lreq, _ = read_request(sock)
+    return write(sock, refuse(req_sid(lreq)))
+end
+
+"Start a server that runs `handler(sock)` per connection; returns (server, port)."
+function start_server(handler)
+    server = listen(ip"127.0.0.1", 0)
+    _, port = getsockname(server)
+    @async while isopen(server)
+        local sock
+        try
+            sock = accept(server)
+        catch
+            break
+        end
+        @async try
+            handler(sock)
+        catch
+            # the client hung up mid-script, which is the point of the test
+        end
+    end
+    return server, Int(port)
+end
+
+"""
+A transport that claims to be open and fails every write: the state a peer
+that has gone away without the socket noticing leaves behind, and the one the
+resilience paths are written for.
+"""
+struct DeadTransport <: IO end
+
+Base.isopen(::DeadTransport) = true
+Base.close(::DeadTransport) = nothing
+function Base.unsafe_write(::DeadTransport, ::Ptr{UInt8}, ::UInt)
+    return throw(Base.IOError("write: broken pipe (EPIPE)", -32))
+end
+
+"A `Connection` over `sock` assembled without a bring-up, for the dead paths."
+function dead_connection(sock::IO=DeadTransport())
+    return Session.Connection(
+        sock,
+        "127.0.0.1",
+        1094,
+        "tester",
+        UInt32(0x520),
+        UInt32(0),
+        UInt8.(1:16),
+        Dict{UInt16,Channel{Session.Frame}}(),
+        ReentrantLock(),
+        ReentrantLock(),
+        UInt16(4),
+        nothing,
+        false,
+        0,
+        nothing,
+        UInt64(0),
+        time(),
+        nothing,
+        0,
+    )
+end
+
 "Start a mock server accepting any number of connections; returns the port."
 function start_mock_server()
     server = listen(ip"127.0.0.1", 0)
@@ -243,6 +320,76 @@ end
         finally
             close(stalled)
         end
+    end
+
+    @testset "connect by URL" begin
+        # root://[user@]host[:port] is the same bring-up, with the account
+        # named in the URL.
+        byurl = Session.connect("root://alice@127.0.0.1:$port")
+        try
+            @test byurl.username == "alice"
+            @test byurl.host == "127.0.0.1"
+            @test byurl.port == Int(port)
+            @test isopen(byurl)
+            # an explicit keyword still wins over the URL's account
+            other = Session.connect("root://alice@127.0.0.1:$port"; username="bob")
+            @test other.username == "bob"
+            close(other)
+        finally
+            close(byurl)
+        end
+
+        # roots:// asks for TLS, and a server that does not offer it fails the
+        # session rather than continuing in cleartext.
+        @test_throws ErrorException Session.connect("roots://127.0.0.1:$port")
+    end
+
+    @testset "a bring-up the server refuses" begin
+        for stage in (:handshake, :protocol, :login)
+            server, badport = start_server(sock -> serve_bad_bringup(sock, stage))
+            try
+                err = try
+                    Session.connect("127.0.0.1", badport; username="tester")
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ErrorException
+                @test occursin(string(Wire.kXR_error), err.msg)
+                @test occursin(stage === :handshake ? "handshake" : "kXR_$(stage)", err.msg)
+            finally
+                close(server)
+            end
+        end
+    end
+
+    @testset "streamid allocation skips 0 and anything in flight" begin
+        # White-box: the allocator must never hand out 0 (which the protocol
+        # reserves for unsolicited frames) nor a streamid still awaiting a
+        # reply, however the counter happens to have wrapped.
+        c = dead_connection()
+        c.nextsid = 0x0000
+        c.pending[0x0001] = Channel{Session.Frame}(1)
+        c.pending[0x0002] = Channel{Session.Frame}(1)
+        sid, _ = Session.register!(c)
+        @test sid == 0x0003
+        @test c.nextsid == 0x0004
+        Session.unregister!(c, sid)
+        @test !haskey(c.pending, sid)
+    end
+
+    @testset "keepalive survives a dead peer" begin
+        # The ping is best-effort: a transport that has gone away must not
+        # take the timer task down with it.
+        c = dead_connection()
+        c.last_activity = time() - 10
+        Session.start_keepalive!(c, 0.05)
+        sleep(0.4)
+        @test c.keepalive isa Task
+        @test !istaskdone(c.keepalive)
+        c.closed = true
+        sleep(0.2)
+        @test istaskdone(c.keepalive)
     end
 
     @testset "close fails pending requests" begin

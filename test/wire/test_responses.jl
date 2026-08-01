@@ -39,6 +39,33 @@ using XRootD.Wire:
         )
         @test r.host == "eos.cern.ch"
         @test r.cgi == "xrd.spr=tls"
+
+        be32(x) = reverse(reinterpret(UInt8, [UInt32(x)]))
+        redirect(text, port=1094) =
+            decode_redirect(vcat(be32(port), Vector{UInt8}(codeunits(text))))
+        # The host field is NUL-terminated, and a server that ends it with a
+        # line break has still only named the host.
+        @test redirect("eos.cern.ch\0trailing junk").host == "eos.cern.ch"
+        @test redirect("eos.cern.ch\r\n").host == "eos.cern.ch"
+        @test redirect("eos.cern.ch\n?a=1") ==
+            (; port=Int32(1094), host="eos.cern.ch", cgi="")
+        # EOS hands the open capability over as "?&cap.sym=…"; the separator is
+        # not part of the token the data server has to be shown.
+        @test redirect("ds1?&cap.sym=abc&cap.msg=def").cgi == "cap.sym=abc&cap.msg=def"
+        @test redirect("ds1??a=1").cgi == "a=1"
+        @test redirect("ds1?").cgi == ""
+        @test redirect("ds1?").host == "ds1"
+        # An IPv6 target arrives bracketed, and the brackets are the host's.
+        @test redirect("[2001:db8::1]?a=1", 1095) ==
+            (; port=Int32(1095), host="[2001:db8::1]", cgi="a=1")
+
+        # The port is signed, and the sign carries meaning: a negative port is
+        # how XRootD 5 says "continue at |port| over TLS". Decoding it as
+        # unsigned would name port 4294966250 and lose the instruction.
+        neg = redirect("ds1", reinterpret(UInt32, Int32(-1046)))
+        @test neg.port == Int32(-1046)
+        @test neg.host == "ds1"
+        @test_throws ArgumentError decode_redirect(UInt8[0x00, 0x00, 0x04])
     end
 
     @testset "kXR_protocol + kXR_login bodies" begin
@@ -183,6 +210,36 @@ end
         # CRC corruption is detected
         pg[5] ⊻= 0xff
         @test_throws ArgumentError decode_pages(pg, off)
+    end
+
+    @testset "kXR_fattr Get response" begin
+        be32(x) = reverse(reinterpret(UInt8, [UInt32(x)]))
+        be16(x) = reverse(reinterpret(UInt8, [UInt16(x)]))
+        nvec(names...) =
+            vcat((vcat(be16(0), Vector{UInt8}(codeunits(n)), 0x00) for n in names)...)
+        vvec(vals...) = vcat((vcat(be32(length(v)), v) for v in vals)...)
+
+        body = vcat(
+            UInt8[0x00, 0x02],                        # errcount, numattr
+            nvec("user.a", "user.b"),
+            vvec(UInt8[0x01, 0x02], UInt8[0x03]),
+        )
+        got = Wire.parse_fattr_get(body, 2)
+        @test [g.rc for g in got] == UInt16[0, 0]
+        @test [g.value for g in got] == [UInt8[0x01, 0x02], UInt8[0x03]]
+
+        # A per-attribute error code travels with an empty value.
+        err = vcat(UInt8[0x01, 0x01], vcat(be16(2), b"user.a", 0x00), vvec(UInt8[]))
+        @test only(Wire.parse_fattr_get(err, 1)) == (; rc=UInt16(2), value=UInt8[])
+
+        # A server that stops short mid-vvec leaves the remaining attributes
+        # valueless rather than reading off the end of the body.
+        @test [g.value for g in Wire.parse_fattr_get(body[1:(end - 5)], 2)] == [UInt8[0x01, 0x02], UInt8[]]
+        # ... and a value whose length overruns the body is taken as far as it goes.
+        long = vcat(UInt8[0x00, 0x01], nvec("user.a"), be32(64), UInt8[0xaa, 0xbb])
+        @test only(Wire.parse_fattr_get(long, 1)).value == UInt8[0xaa, 0xbb]
+
+        @test_throws ArgumentError Wire.parse_fattr_get(UInt8[0x00], 1)
     end
 
     @testset "pgwrite checksum-error trailer" begin
