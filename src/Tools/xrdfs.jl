@@ -100,8 +100,13 @@ function shell(fs::XrdCl.FileSystem)
     while true
         print("xrdfs> ")
         line = readline(stdin)
-        isempty(line) && !eof(stdin) && continue
-        (eof(stdin) || strip(line) == "exit" || strip(line) == "quit") && break
+        # Only an empty read means end of input: a piped script whose last
+        # line is a command must still see that command run.
+        if isempty(line)
+            eof(stdin) && break
+            continue
+        end
+        strip(line) in ("exit", "quit") && break
         parts = split(strip(line))
         isempty(parts) && continue
         run_command(fs, parts[1], String.(parts[2:end]))

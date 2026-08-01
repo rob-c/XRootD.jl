@@ -13,10 +13,12 @@ module Tools
 
 using ..XrdCl
 using ..Storage
-using ..Storage: storage_for, storage_stat, storage_read, storage_write, storage_list
+using ..Storage:
+    storage_for, storage_stat, storage_read, storage_write, storage_list, storage_mkdir
 using CRC32c: CRC32c
+using Sockets: gethostname
 
-export copyfile, copytree
+export copyfile, copytree, tpc_copy
 export adler32, crc64xz, checksum_file
 
 # Exit codes (mirror libxrdc xrdc_shellcode).
@@ -25,6 +27,7 @@ const EXIT_USAGE = 2
 const EXIT_ERROR = 1
 
 include("checksums.jl")
+include("tpc.jl")
 include("copy.jl")
 include("xrdcp.jl")
 include("xrdfs.jl")
