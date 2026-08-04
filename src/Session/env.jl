@@ -122,6 +122,41 @@ const DEFAULT_REDIRECT_LIMIT = 8
 redirect_limit() = env_int("XRD_REDIRECTLIMIT", DEFAULT_REDIRECT_LIMIT)
 
 """
+How many EXTRA `kXR_bind` data sub-streams a file opens beside the control
+link. One — the default — matches the Go (go-hep), Rust and Python clients: a
+single data path carries the file's bulk reads and writes while the control
+link stays free for headers and other requests. Zero keeps everything on the
+one link, which is all a lone transfer on an idle session ever needed.
+"""
+const DEFAULT_DATA_STREAMS = 1
+
+"""
+    data_streams() -> Int
+
+The number of extra data sub-streams a newly opened [`File`](@ref) binds by
+default. `\$XRDC_DATA_STREAMS` — this client's own knob — counts the extra
+links directly. Failing that, XrdCl's `\$XRD_SUBSTREAMSPERCHANNEL` is honoured
+for a process already configured for the reference client; it counts the
+control link, so its N is our N-1 (its `2` is one extra here, its `1` is none).
+An unparseable or missing value leaves [`DEFAULT_DATA_STREAMS`](@ref) standing;
+a negative one is clamped to zero, because a typo in a site profile should
+degrade to the default, never to an error on every open.
+"""
+function data_streams()
+    v = strip(get(ENV, "XRDC_DATA_STREAMS", ""))
+    if !isempty(v)
+        n = tryparse(Int, v)
+        return (n === nothing) ? DEFAULT_DATA_STREAMS : max(0, n)
+    end
+    w = strip(get(ENV, "XRD_SUBSTREAMSPERCHANNEL", ""))
+    if !isempty(w)
+        n = tryparse(Int, w)
+        return (n === nothing) ? DEFAULT_DATA_STREAMS : max(0, n - 1)
+    end
+    return DEFAULT_DATA_STREAMS
+end
+
+"""
 Authentication mechanisms in the order they are tried, best first. `ztn`
 (bearer token) before `sss` (shared secret) before `unix` (an assertion the
 server may or may not believe).

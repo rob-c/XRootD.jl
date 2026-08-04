@@ -13,11 +13,13 @@ using XRootD: Session, Storage, XrdCl
 using XRootD.Session:
     DEFAULT_AUTH_ORDER,
     DEFAULT_CONNECTION_WINDOW_S,
+    DEFAULT_DATA_STREAMS,
     DEFAULT_MAX_WAIT_MS,
     DEFAULT_REDIRECT_LIMIT,
     REDACTED,
     auth_order,
     connection_window_s,
+    data_streams,
     env_cafile,
     env_flag,
     env_int,
@@ -138,6 +140,47 @@ using XRootD.Session:
             @test connection_window_s() == 5
             @test stream_timeout_s() == 60
             @test redirect_limit() == 2
+        end
+    end
+
+    @testset "the default data sub-streams" begin
+        # Nothing set: one extra data stream, matching the Go/Rust/Python clients.
+        withenv("XRDC_DATA_STREAMS" => nothing, "XRD_SUBSTREAMSPERCHANNEL" => nothing) do
+            @test data_streams() == DEFAULT_DATA_STREAMS == 1
+        end
+        # XrdCl's variable counts the control link, so its N is our N-1: a job
+        # that configured the reference client for two streams per channel gets
+        # one extra here, and "1 there" (control only) is none.
+        withenv("XRDC_DATA_STREAMS" => nothing) do
+            withenv("XRD_SUBSTREAMSPERCHANNEL" => "2") do
+                @test data_streams() == 1
+            end
+            withenv("XRD_SUBSTREAMSPERCHANNEL" => "1") do
+                @test data_streams() == 0
+            end
+            withenv("XRD_SUBSTREAMSPERCHANNEL" => "5") do
+                @test data_streams() == 4
+            end
+            # An unparseable count falls back to the default rather than erroring
+            # every open a mistyped profile makes.
+            withenv("XRD_SUBSTREAMSPERCHANNEL" => "lots") do
+                @test data_streams() == DEFAULT_DATA_STREAMS
+            end
+        end
+        # This client's own knob counts the extra links directly and wins over
+        # the XrdCl one, being the more specific of the two.
+        withenv("XRD_SUBSTREAMSPERCHANNEL" => "9") do
+            withenv("XRDC_DATA_STREAMS" => "3") do
+                @test data_streams() == 3
+            end
+            withenv("XRDC_DATA_STREAMS" => "0") do
+                @test data_streams() == 0
+            end
+            # A negative count is a typo, not a request for negative links: clamp
+            # to zero rather than fail.
+            withenv("XRDC_DATA_STREAMS" => "-2") do
+                @test data_streams() == 0
+            end
         end
     end
 

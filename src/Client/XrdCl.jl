@@ -14,6 +14,7 @@ module XrdCl
 
 using ..Wire
 using ..Session
+import ..Session: data_streams
 
 export XRootDStatus, isOK, isError, error_name
 export FileSystem, ping, locate, deep_locate, query, rmdir, protocol
@@ -24,7 +25,7 @@ export getxattr, setxattr, listxattr, removexattr, xattrs
 export statvfs, checksum, checksum_cancel, prepare
 export checkpoint, checkpoint_begin, checkpoint_commit, checkpoint_rollback
 export checkpoint_query, checkpoint_write, checkpoint_truncate
-export reopen!, recoverable, bind_data_path!
+export reopen!, recoverable, bind_data_path!, data_streams
 export symlink, hardlink, readlink
 export isExecutable, isOffline
 export ismanager, isserver, ismeta, isproxy, issupervisor

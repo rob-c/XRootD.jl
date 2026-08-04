@@ -597,7 +597,11 @@ stall deadline armed: a client that desynchronizes the stream — the way a
 wrong `kXR_writev` framing would — then FAILS the test instead of hanging it.
 """
 function conf_file(port::Int, flags=XRootD.XrdCl.OpenFlags.Update; stall_ms=CONF_STALL_MS)
-    f = XRootD.XrdCl.File("root://127.0.0.1:$port//conf", flags)
+    # Stay on the control link by default: these tests exercise protocol
+    # conformance and bind data paths explicitly where that is the subject, so
+    # the open-time default (one data stream) would add a bind they did not ask
+    # for. The default itself is covered in test_datapath.jl.
+    f = XRootD.XrdCl.File("root://127.0.0.1:$port//conf", flags; data_streams=0)
     f === nothing && return nothing
     conn = f.conn
     conn === nothing || (conn.stall_deadline_ms = stall_ms)

@@ -16,7 +16,7 @@ using XRootD.XrdCl: bind_data_path!
         st, pathid = bind_data_path!(f)
         @test isOK(st)
         @test pathid != 0x00
-        @test f.pathid == pathid
+        @test f.pathids == [pathid]
         @test Session.has_data_path(f.conn, pathid)
         @test Session.data_paths(f.conn) == [pathid]
         # The bind presented the session id the login reply gave out — the
@@ -24,6 +24,43 @@ using XRootD.XrdCl: bind_data_path!
         @test length(srv.logins) == 1
         @test Wire.kXR_bind in srv.ops
         close(f)
+        @test isempty(srv.violations)
+    end
+
+    @testset "open binds the default data streams by itself" begin
+        # The library default is one extra data stream, so a plain open — the
+        # way a caller who set nothing gets — comes back already bound, and its
+        # reads and writes ride the data path with no explicit bind call.
+        conf_reset!(srv)
+        withenv("XRDC_DATA_STREAMS" => nothing, "XRD_SUBSTREAMSPERCHANNEL" => nothing) do
+            f = XRootD.XrdCl.File("root://127.0.0.1:$port//conf", OpenFlags.Read)
+            @test length(f.pathids) == 1
+            @test XRootD.XrdCl.data_pathid(f) == f.pathids[1]
+            st, buf = read(f, length(CONF_CONTENT), 0)
+            @test isOK(st) && buf == CONF_CONTENT
+            close(f)
+        end
+        @test Wire.kXR_bind in srv.ops
+        @test length(srv.logins) == 1        # the data path bound, it did not re-login
+        @test isempty(srv.violations)
+
+        # data_streams=0 keeps everything on the control link: no bind, no path.
+        conf_reset!(srv)
+        f0 = XRootD.XrdCl.File("root://127.0.0.1:$port//conf", OpenFlags.Read; data_streams=0)
+        @test isempty(f0.pathids)
+        @test XRootD.XrdCl.data_pathid(f0) == 0x00
+        @test !(Wire.kXR_bind in srv.ops)
+        close(f0)
+        @test isempty(srv.violations)
+
+        # Several streams bind several links and hand requests out round-robin.
+        conf_reset!(srv)
+        f3 = XRootD.XrdCl.File("root://127.0.0.1:$port//conf", OpenFlags.Read; data_streams=3)
+        @test length(f3.pathids) == 3
+        @test allunique(f3.pathids)
+        seq = [XRootD.XrdCl.data_pathid(f3) for _ in 1:6]
+        @test seq == vcat(f3.pathids, f3.pathids)   # two full cycles of the three
+        close(f3)
         @test isempty(srv.violations)
     end
 

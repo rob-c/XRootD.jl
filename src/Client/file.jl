@@ -35,7 +35,11 @@ mutable struct File
     mode::UInt16
     opts::Dict{Symbol,Any}
     cpsize::Int32
-    pathid::UInt8
+    # The extra kXR_bind data sub-streams this file's bulk I/O rides on (empty =
+    # the control link only). `data_streams` (default 1) binds these at open;
+    # `rr` round-robins reads and writes across the live ones per request.
+    pathids::Vector{UInt8}
+    rr::Int
     owns_conn::Bool
 end
 
@@ -51,7 +55,8 @@ function File()
         0x0000,
         Dict{Symbol,Any}(),
         0,
-        0x00,
+        UInt8[],
+        0,
         true,
     )
 end
@@ -195,6 +200,7 @@ function Base.open(
     mode=0x0000;
     max_hops::Int=Session.redirect_limit(),
     conn::Union{Session.Connection,Nothing}=nothing,
+    data_streams::Integer=Session.data_streams(),
     kwargs...,
 )
     f.isopen && return XRootDStatus(0x0001, 0x0000, 0, "file already open"), nothing
@@ -288,6 +294,23 @@ function Base.open(
         else
             stst, si = stat(f)
             f.filesize = isOK(stst) && si !== nothing ? si.size : 0
+        end
+        # Bind the default data sub-stream(s) for this file's bulk I/O. Only on
+        # a session the file owns — a borrowed connection's streams belong to
+        # whoever opened it — and never fatal: a server that will not bind one
+        # leaves the transfer on the control link, which still works. Only the
+        # new link's TLS handshake is configurable, so no login credential is
+        # forwarded (the bind presents the session id, it does not re-login).
+        if f.owns_conn && data_streams >= 1
+            bindkw = filter(
+                p -> first(p) in
+                     (:insecure_tls, :cert, :key, :cafile, :x509, :connect_timeout),
+                opts,
+            )
+            for _ in 1:data_streams
+                bst, _ = bind_data_path!(f; bindkw...)
+                isOK(bst) || break
+            end
         end
         return st, nothing
     end
@@ -433,21 +456,27 @@ function bind_data_path!(f::File; kwargs...)
     catch err
         return XRootDStatus(0x0001, 0x0000, 0, sprint(showerror, err)), 0x00
     end
-    f.pathid = pathid
+    push!(f.pathids, pathid)
     return XRootDStatus(), pathid
 end
 
 """
-The data path this file's requests should name: the one it bound, unless the
-connection no longer has it. A reopen replaces the session, and the id it
-issued died with it — so the check is made per request rather than trusting
-what was stored.
+The data path this file's next request should name, or `0x00` for the control
+link. With one bound path — the default — that path carries every read and
+write; with several, requests are handed out round-robin so the bulk spreads
+across the links. A reopen replaces the session and voids the ids it issued,
+so liveness is checked per request rather than trusting what was stored: a
+path the connection no longer has is skipped, and a file that has lost all of
+them falls back to the control link.
 """
 function data_pathid(f::File)
-    f.pathid == 0x00 && return 0x00
+    isempty(f.pathids) && return 0x00
     conn = f.conn
     conn === nothing && return 0x00
-    return Session.has_data_path(conn, f.pathid) ? f.pathid : 0x00
+    live = filter(p -> Session.has_data_path(conn, p), f.pathids)
+    isempty(live) && return 0x00
+    f.rr += 1
+    return live[(f.rr - 1) % length(live) + 1]
 end
 
 """
