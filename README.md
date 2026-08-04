@@ -8,8 +8,9 @@
 
 ## Description
 
-Julia bindings for the [XRootD](https://xrootd.slac.stanford.edu) high performance, scalable, and fault tolerant access to data repositories. It facilitates the interface with the XRootD client, by writing Julia code instead of having to write C++.
-This package is developed using the [CxxWrap.jl](https://github.com/JuliaInterop/CxxWrap.jl) package to wrap C++ types and functions to Julia. Wrapper C++ code is generated with the help of [WrapIt](https://github.com/grasph/wrapit) tool that uses of the clang library.
+A Julia client for [XRootD](https://xrootd.slac.stanford.edu), the high performance, scalable, and fault tolerant protocol for access to data repositories.
+
+As of 0.3, the protocol is implemented natively in Julia over `Sockets`. There is no binding to the XrdCl C++ library and no compiled dependency beyond standard Julia packages, so the package installs and precompiles like any other.
 
 The Julia interface has been inspired by the functionality provided by [pyxrootd](https://xrootd.slac.stanford.edu/doc/doxygen/5.6.4/python/), which implements a set of simple but pythonic bindings for XRootD. In the case of Julia, we have used the same function names if there was an equivalent in the `Base` module.
 
