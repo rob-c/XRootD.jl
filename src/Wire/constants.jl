@@ -58,18 +58,73 @@ const kXR_wait      = UInt16(4005)
 const kXR_waitresp  = UInt16(4006)
 const kXR_status    = UInt16(4007)
 
+# ---- server error codes (ServerResponseBody_Error.errnum; XErrorCode) ----
+# Distinct from POSIX errno, and sharing their numeric range with the request
+# opcodes without being related to them: 3011 is kXR_ping as a request and
+# kXR_NotFound as an error. 3022, 3023, 3026 and 3029 are unassigned.
+const kXR_ArgInvalid     = UInt16(3000)
+const kXR_ArgMissing     = UInt16(3001)
+const kXR_ArgTooLong     = UInt16(3002)
+const kXR_FileLocked     = UInt16(3003)
+const kXR_FileNotOpen    = UInt16(3004)
+const kXR_FSError        = UInt16(3005)
+const kXR_InvalidRequest = UInt16(3006)
+const kXR_IOError        = UInt16(3007)
+const kXR_NoMemory       = UInt16(3008)
+const kXR_NoSpace        = UInt16(3009)
+const kXR_NotAuthorized  = UInt16(3010)
+const kXR_NotFound       = UInt16(3011)
+const kXR_ServerError    = UInt16(3012)
+const kXR_Unsupported    = UInt16(3013)
+const kXR_noserver       = UInt16(3014)
+const kXR_NotFile        = UInt16(3015)
+const kXR_isDirectory    = UInt16(3016)
+const kXR_Cancelled      = UInt16(3017)
+const kXR_ItExists       = UInt16(3018)
+const kXR_ChkSumErr      = UInt16(3019)
+const kXR_inProgress     = UInt16(3020)
+const kXR_overQuota      = UInt16(3021)
+const kXR_Overloaded     = UInt16(3024)
+const kXR_fsReadOnly     = UInt16(3025)
+const kXR_AttrNotFound   = UInt16(3027)
+const kXR_TLSRequired    = UInt16(3028)
+const kXR_AuthFailed     = UInt16(3030)
+const kXR_Impossible     = UInt16(3031)
+const kXR_Conflict       = UInt16(3032)
+const kXR_TooManyErrs    = UInt16(3033)
+
 # ---- kXR_attn action codes (still-active subset) ----
 const kXR_asyncms   = UInt32(5002)
 const kXR_asynresp  = UInt32(5008)
 
 # ---- kXR_protocol response flags (server type + TLS negotiation) ----
+# The role bits say what the endpoint that answered is: `kXR_isServer` holds
+# data, `kXR_isManager` redirects to something that does. The attribute bits
+# qualify a role rather than replacing it — a supervisor is a manager that is
+# itself subordinate to one, a proxy fronts a foreign cluster, a meta-manager
+# manages managers — so they are read alongside the role, not instead of it.
+const kXR_isServer  = UInt32(0x00000001)
+const kXR_isManager = UInt32(0x00000002)
+const kXR_attrMeta  = UInt32(0x00000100)
+const kXR_attrProxy = UInt32(0x00000200)
+const kXR_attrSuper = UInt32(0x00000400)
+
 const kXR_haveTLS  = UInt32(0x80000000)  # server accepts in-protocol TLS upgrade
 const kXR_gotoTLS  = UInt32(0x40000000)  # client must upgrade immediately
+const kXR_tlsGPFA  = UInt32(0x20000000)  # anonymous gpfile requires TLS
 const kXR_tlsTPC   = UInt32(0x10000000)  # third-party copy must run over TLS
 const kXR_tlsSess  = UInt32(0x08000000)  # the session after login requires TLS
 const kXR_tlsLogin = UInt32(0x04000000)  # the login exchange requires TLS
-const kXR_tlsData  = UInt32(0x02000000)  # file data must move over TLS
-const kXR_tlsGPF   = UInt32(0x01000000)  # gpfile requests require TLS
+const kXR_tlsGPF   = UInt32(0x02000000)  # gpfile requests require TLS
+const kXR_tlsData  = UInt32(0x01000000)  # file data must move over TLS
+const kXR_tlsAny   = UInt32(0x1f000000)  # every per-request TLS bit
+
+# The capabilities a server volunteers in the same word: what it can do, as
+# opposed to what it insists on.
+const kXR_anongpf  = UInt32(0x00800000)  # gpfile is open to unauthenticated clients
+const kXR_supgpf   = UInt32(0x00400000)  # kXR_gpfile is answered at all
+const kXR_suppgrw  = UInt32(0x00200000)  # kXR_pgread / kXR_pgwrite are answered
+const kXR_supposc  = UInt32(0x00100000)  # kXR_posc (persist on successful close)
 
 """
 The `kXR_protocol` flags that oblige the client to upgrade during bring-up.
@@ -97,13 +152,17 @@ const kXR_ver005  = 0x05   # XRootD v5 client (TLS + sigver capable)
 
 const SESSION_ID_LEN = 16  # opaque sessid bytes in the login response
 
+"The all-zero file handle: what a request that names a path, not an open file, sends."
+const NULL_FHANDLE = (0x00, 0x00, 0x00, 0x00)
+
 # ---- kXR_dirlist options ----
-const kXR_online = 0x01
-const kXR_dstat  = 0x02
-const kXR_dcksm  = 0x04
+const kXR_online = 0x01   # list only the entries whose data is online now
+const kXR_dstat  = 0x02   # a stat line per entry
+const kXR_dcksm  = 0x04   # a checksum per entry; implies kXR_dstat whatever it says
 
 # ---- kXR_stat options ----
-const kXR_vfs = 0x01
+const kXR_vfs          = 0x01
+const kXR_statNoFollow = 0x02  # stat the symlink itself, not its target (lstat)
 
 # ---- kXR_open options (u16; flags.h) ----
 const kXR_compress  = UInt16(0x0001)
@@ -112,10 +171,15 @@ const kXR_force     = UInt16(0x0004)
 const kXR_new       = UInt16(0x0008)  # fail if the file exists
 const kXR_open_read = UInt16(0x0010)
 const kXR_open_updt = UInt16(0x0020)  # O_RDWR
+const kXR_async     = UInt16(0x0040)  # asynchronous i/o is acceptable
 const kXR_refresh   = UInt16(0x0080)
 const kXR_mkpath    = UInt16(0x0100)  # create parent directories
 const kXR_open_apnd = UInt16(0x0200)
 const kXR_retstat   = UInt16(0x0400)  # return stat info with the open reply
+const kXR_replica   = UInt16(0x0800)  # this copy is a replica
+const kXR_posc      = UInt16(0x1000)  # persist on successful close only
+const kXR_nowait    = UInt16(0x2000)  # answer now even if the file is offline
+const kXR_seqio     = UInt16(0x4000)  # access will be sequential
 const kXR_open_wrto = UInt16(0x8000)  # write-only
 
 # ---- kXR_mkdir options byte ----
@@ -127,6 +191,7 @@ const kXR_QPrep   = UInt16(2)
 const kXR_Qcksum  = UInt16(3)
 const kXR_Qxattr  = UInt16(4)
 const kXR_Qspace  = UInt16(5)
+const kXR_Qckscan = UInt16(6)   # rescan/recompute the checksum
 const kXR_Qconfig = UInt16(7)
 const kXR_Qvisa   = UInt16(8)
 const kXR_Qopaque = UInt16(16)
@@ -135,6 +200,11 @@ const kXR_Qopaqug = UInt16(64)
 
 # ---- kXR_writev options byte ----
 const kXR_wv_doSync = 0x01   # fsync each touched handle after the write
+
+# ---- kXR_clone payload (src_fhandle[4] rsvd[4] src_offset[8] src_len[8]
+# dst_offset[8], all big-endian) ----
+const CLONE_ITEM_LEN = 32
+const CLONE_MAXITEMS = 1024  # maxClonesz
 
 # ---- kXR_sigver (flags.h) ----
 const kXR_SHA256_sig = 0x01  # HMAC algorithm is HMAC-SHA256
@@ -147,6 +217,14 @@ const kXR_fattrList = 0x02
 const kXR_fattrSet  = 0x03
 const kXR_fa_isNew  = 0x01   # (set) fail if the attribute already exists
 const kXR_fa_aData  = 0x10   # (list) include values in the response
+const kXR_fattrMaxVars = 16  # attributes one kXR_fattr request may name
+
+# ---- kXR_chkpoint subcodes (opcodes.h) ----
+const kXR_ckpBegin    = 0x00  # open a checkpoint on the handle
+const kXR_ckpCommit   = 0x01  # make the checkpointed writes permanent
+const kXR_ckpQuery    = 0x02  # ask what the server will accept
+const kXR_ckpRollback = 0x03  # undo them
+const kXR_ckpXeq      = 0x04  # run the enclosed request inside the checkpoint
 
 # ---- kXR_prepare options byte (flags.h) ----
 const kXR_cancel = 0x01
@@ -154,6 +232,22 @@ const kXR_notify = 0x02
 const kXR_noerrs = 0x04
 const kXR_stage  = 0x08
 const kXR_wmode  = 0x10
+const kXR_coloc  = 0x20   # co-locate with the previously prepared file
+const kXR_fresh  = 0x40   # requeue even if already staged
+const kXR_usetcp = 0x80   # notify over TCP rather than UDP
+
+# `kXR_evict` is a modifier for the *optionX* half-word, not the options byte —
+# which is why it can reuse 0x0001 without colliding with `kXR_cancel`. Both
+# PyXRootDClient and XrdRust record it as an options-byte 0x80; upstream
+# XProtocol.hh and libxrdc (`xrdfs_attr.c` passes it as the optionX argument)
+# say otherwise, and this follows them.
+const kXR_evict = UInt16(0x0001)
+
+# ---- kXR_locate options (u16; flags.h) ----
+const kXR_addPeers   = UInt16(0x0001)  # include peers, not just servers
+const kXR_refreshLoc = UInt16(0x0080)  # bypass the redirector's cache
+const kXR_prefname   = UInt16(0x0100)  # report host names, not addresses
+const kXR_nowaitLoc  = UInt16(0x2000)  # answer from what is known now
 
 # ---- kXR_setattr (vendor ext) ----
 const kXR_sa_times = Int32(0x01)   # apply atime/mtime
@@ -178,7 +272,9 @@ const VEC_MAXSEGS  = 1024                # readv/writev segment count cap
 const VEC_MAXBYTES = 256 * 1024 * 1024   # aggregate readv/writev payload cap
 const DLEN_MAX     = 64 * 1024 * 1024    # sanity cap on one response body
 
-# ---- stat flags bitfield (flags.h; StatInfo.flags) ----
+# ---- stat flags bitfield (flags.h; StatInfo.flags, and one byte per path in
+# a kXR_statx reply) ----
+const kXR_file     = UInt32(0x00)  # a plain file: the absence of every other bit
 const kXR_xset     = UInt32(0x01)  # executable / searchable
 const kXR_isDir    = UInt32(0x02)
 const kXR_other    = UInt32(0x04)  # neither regular file nor directory
@@ -186,6 +282,7 @@ const kXR_offline  = UInt32(0x08)
 const kXR_readable = UInt32(0x10)
 const kXR_writable = UInt32(0x20)
 const kXR_poscpend = UInt32(0x40)
+const kXR_bkpexist = UInt32(0x80)  # a backup copy exists
 
 #! format: on
 
@@ -238,4 +335,50 @@ error messages. Unknown ids render as `"kXR_unknown(id)"`. Mirrors libxrdc's
 """
 function request_name(id::Integer)
     return get(_REQUEST_NAMES, UInt16(id), "kXR_unknown($(Int(id)))")
+end
+
+const _ERROR_NAMES = Dict{UInt16,String}(
+    kXR_ArgInvalid => "kXR_ArgInvalid",
+    kXR_ArgMissing => "kXR_ArgMissing",
+    kXR_ArgTooLong => "kXR_ArgTooLong",
+    kXR_FileLocked => "kXR_FileLocked",
+    kXR_FileNotOpen => "kXR_FileNotOpen",
+    kXR_FSError => "kXR_FSError",
+    kXR_InvalidRequest => "kXR_InvalidRequest",
+    kXR_IOError => "kXR_IOError",
+    kXR_NoMemory => "kXR_NoMemory",
+    kXR_NoSpace => "kXR_NoSpace",
+    kXR_NotAuthorized => "kXR_NotAuthorized",
+    kXR_NotFound => "kXR_NotFound",
+    kXR_ServerError => "kXR_ServerError",
+    kXR_Unsupported => "kXR_Unsupported",
+    kXR_noserver => "kXR_noserver",
+    kXR_NotFile => "kXR_NotFile",
+    kXR_isDirectory => "kXR_isDirectory",
+    kXR_Cancelled => "kXR_Cancelled",
+    kXR_ItExists => "kXR_ItExists",
+    kXR_ChkSumErr => "kXR_ChkSumErr",
+    kXR_inProgress => "kXR_inProgress",
+    kXR_overQuota => "kXR_overQuota",
+    kXR_Overloaded => "kXR_Overloaded",
+    kXR_fsReadOnly => "kXR_fsReadOnly",
+    kXR_AttrNotFound => "kXR_AttrNotFound",
+    kXR_TLSRequired => "kXR_TLSRequired",
+    kXR_AuthFailed => "kXR_AuthFailed",
+    kXR_Impossible => "kXR_Impossible",
+    kXR_Conflict => "kXR_Conflict",
+    kXR_TooManyErrs => "kXR_TooManyErrs",
+)
+
+"""
+    error_name(code::Integer) -> String
+
+The protocol name of a server error code (`3011` → `"kXR_NotFound"`), for
+traces and error messages. Unassigned codes render as `"kXR_error(code)"`.
+
+The counterpart of [`request_name`](@ref), and not interchangeable with it:
+the two enumerations overlap numerically without overlapping in meaning.
+"""
+function error_name(code::Integer)
+    return get(_ERROR_NAMES, UInt16(code), "kXR_error($(Int(code)))")
 end

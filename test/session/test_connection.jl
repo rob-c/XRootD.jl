@@ -224,6 +224,8 @@ function dead_connection(sock::IO=DeadTransport())
         time(),
         nothing,
         0,
+        Dict{UInt8,Session.DataPath}(),
+        Dict{UInt16,UInt8}(),
     )
 end
 
@@ -376,6 +378,29 @@ end
         @test c.nextsid == 0x0004
         Session.unregister!(c, sid)
         @test !haskey(c.pending, sid)
+    end
+
+    @testset "a lost data path fails only what it was carrying" begin
+        # White-box: the second socket dying must cost the requests routed
+        # over it and nothing else — the control link is a separate socket and
+        # everything not naming the path is still answerable on it.
+        c = dead_connection()
+        path = Session.DataPath(
+            DeadTransport(), 0x02, ReentrantLock(), Ref{Union{Task,Nothing}}(nothing)
+        )
+        c.datapaths[0x02] = path
+        routed, ch_routed = Session.register!(c)
+        _, ch_control = Session.register!(c)
+        c.routed[routed] = 0x02
+
+        Session.fail_routed!(c, path, Base.IOError("read: connection reset", -104))
+        @test !Session.has_data_path(c, 0x02)
+        @test isopen(c)
+        hdr, body = take!(ch_routed)
+        @test hdr.status == Wire.kXR_error
+        @test hdr.streamid == routed
+        @test occursin("data path 2", Wire.decode_error(body).message)
+        @test !isready(ch_control)
     end
 
     @testset "keepalive survives a dead peer" begin

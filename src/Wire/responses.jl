@@ -96,6 +96,21 @@ function decode_login(body::AbstractVector{UInt8})
 end
 
 """
+    decode_bind(body) -> UInt8
+
+Decode a `kXR_bind` response body: one byte, the path id the server assigned
+to this connection. Zero is refused rather than returned — it is the id of
+the control link, so a request carrying it would send its data back down the
+link the bind was meant to relieve.
+"""
+function decode_bind(body::AbstractVector{UInt8})
+    isempty(body) && throw(ArgumentError("kXR_bind reply carried no path id"))
+    id = body[1]
+    id == 0x00 && throw(ArgumentError("kXR_bind reply named path id 0, the control link"))
+    return id
+end
+
+"""
     parse_stat_line(line) -> (; id, size, flags, mtime, ctime, atime, mode, owner, group, has_ext)
 
 Parse the ASCII stat line `"<id> <size> <flags> <mtime>"` returned by
@@ -122,6 +137,54 @@ function parse_stat_line(line::AbstractString)
         group=has_ext ? String(parts[9]) : "",
         has_ext=has_ext,
     )
+end
+
+"""
+    parse_statx(body, npaths) -> Vector{UInt8}
+
+Decode a `kXR_statx` reply: one flags byte per path asked about, in the order
+asked. The bits are the `kXR_isDir` / `kXR_offline` / `kXR_readable` set; a
+plain readable file is `kXR_readable` alone, and `kXR_file` is the absence of
+every type bit rather than a bit of its own.
+
+A reply that does not have exactly one byte per path is a protocol error:
+the answers are positional, so a short one cannot be matched back to the
+paths that produced it.
+"""
+function parse_statx(body::AbstractVector{UInt8}, npaths::Integer)
+    if length(body) != npaths
+        throw(
+            ArgumentError(
+                "kXR_statx answered $(length(body)) flag bytes for $(npaths) paths"
+            ),
+        )
+    end
+    return Vector{UInt8}(body)
+end
+
+"""
+    parse_bind(body) -> UInt8
+
+Decode a `kXR_bind` reply: the path id the server assigned this connection,
+which a request names to have its data routed over it. A server that sends
+an empty body has bound the connection without giving it an id of its own.
+"""
+parse_bind(body::AbstractVector{UInt8}) = isempty(body) ? 0x00 : UInt8(body[1])
+
+"""
+    parse_checkpoint(body) -> (; capacity::UInt32, used::UInt32)
+
+Decode a `kXR_chkpoint`/`kXR_ckpQuery` reply. `capacity` bounds the *undo*,
+not the file: a transaction that overwrites more than that many bytes is one
+the server can no longer roll back, and it refuses the write rather than
+lose the ability. `used` is how much of it the open checkpoint holds — zero
+when none is active.
+"""
+function parse_checkpoint(body::AbstractVector{UInt8})
+    if length(body) < 8
+        throw(ArgumentError("kXR_ckpQuery body needs ≥ 8 bytes, got $(length(body))"))
+    end
+    return (; capacity=get_u32(body, 1), used=get_u32(body, 5))
 end
 
 """
@@ -314,18 +377,50 @@ end
 # (DirectoryList::dStatPrefix; see dirlist_fmt.h).
 const _DSTAT_SENTINEL = ".\n0 0 0 0"
 
+"One entry's `kXR_dcksm` digest: the algorithm the server used and its hex value."
+const CksumToken = @NamedTuple{algorithm::String, value::String}
+
 """
-    parse_dirlist(body) -> (; entries::Vector{String}, stats)
+    parse_cksum_token(line) -> CksumToken | nothing
+
+Pull the `" [ algo:hexdigest ]"` token a `kXR_dcksm` listing appends to an
+entry's stat line, or `nothing` from a line that carries none.
+
+`value` is `"none"` when the server had no digest to give — the entry is a
+directory, or a file it could not open. That is an answer about the entry,
+not a failure of the listing, so it is passed through rather than raised.
+"""
+function parse_cksum_token(line::AbstractString)
+    s = rstrip(rstrip(line, '\0'))
+    endswith(s, "]") || return nothing
+    opened = findlast('[', s)
+    opened === nothing && return nothing
+    inner = strip(SubString(s, nextind(s, opened), prevind(s, lastindex(s))))
+    colon = findfirst(':', inner)
+    (colon === nothing || colon == firstindex(inner)) && return nothing
+    algorithm = String(SubString(inner, firstindex(inner), prevind(inner, colon)))
+    value = String(SubString(inner, nextind(inner, colon)))
+    return isempty(value) ? nothing : (; algorithm, value)
+end
+
+"""
+    parse_dirlist(body) -> (; entries::Vector{String}, stats, cksums)
 
 Parse an accumulated `kXR_dirlist` response body. Plain listings are
 newline-separated names (`stats === nothing`). When the request set
 `kXR_dstat`, the body starts with the `".\\n0 0 0 0\\n"` sentinel and carries
 `name\\nstatline` pairs; `stats[i]` is then [`parse_stat_line`](@ref) of
 entry `i`'s line.
+
+`kXR_dcksm` rides in the same body: each stat line is the extended 9-field
+form with a `" [ algo:hexdigest ]"` token appended, and `cksums[i]` is that
+token ([`parse_cksum_token`](@ref)). A listing that carries no token at all
+answers `cksums === nothing`, which is what a `kXR_dstat` listing and a
+server that ignored the option both look like.
 """
 function parse_dirlist(body::AbstractVector{UInt8})
     text = rstrip(String(copy(body)), '\0')
-    isempty(text) && return (; entries=String[], stats=nothing)
+    isempty(text) && return (; entries=String[], stats=nothing, cksums=nothing)
     lines = split(text, '\n'; keepempty=false)
     if startswith(text, _DSTAT_SENTINEL)
         rest = lines[3:end]   # drop the two sentinel lines
@@ -334,9 +429,13 @@ function parse_dirlist(body::AbstractVector{UInt8})
         end
         entries = [String(rest[i]) for i in 1:2:length(rest)]
         stats = [parse_stat_line(rest[i + 1]) for i in 1:2:length(rest)]
-        return (; entries, stats)
+        tokens = Union{Nothing,CksumToken}[
+            parse_cksum_token(rest[i + 1]) for i in 1:2:length(rest)
+        ]
+        cksums = all(isnothing, tokens) ? nothing : tokens
+        return (; entries, stats, cksums)
     end
-    return (; entries=String.(lines), stats=nothing)
+    return (; entries=String.(lines), stats=nothing, cksums=nothing)
 end
 
 # ---- extended-operation response decoders ----

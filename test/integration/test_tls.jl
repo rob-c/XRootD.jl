@@ -3,6 +3,7 @@
 # FileSystem ops over the encrypted session.
 
 using XRootD.XrdCl
+using XRootD.XrdCl: bind_data_path!
 using XRootD: Session
 
 @testset "roots:// TLS" begin
@@ -44,6 +45,26 @@ using XRootD: Session
         st, _ = copy(fs, "/tmp/tls_testfile", "/tmp/tls_testfile2"; force=true)
         @test isOK(st)
         @test read("/tmp/tls_testfile2", String) == "encrypted hello"
+        # A data path inherits the control link's encryption: the second socket
+        # is brought up wanting TLS and upgraded before the bind, so the bulk
+        # bytes are not carried in the clear by the link that was relieved.
+        f = File()
+        st, _ = open(
+            f,
+            "roots://localhost:10944//tmp/tls_testfile",
+            OpenFlags.Read;
+            insecure_tls=true,
+        )
+        @test isOK(st)
+        st, pathid = bind_data_path!(f; insecure_tls=true)
+        @test isOK(st)
+        @test pathid != 0x00
+        @test Session.has_data_path(f.conn, pathid)
+        st, buf = read(f, 15, 0)
+        @test isOK(st)
+        @test String(buf) == "encrypted hello"
+        close(f)
+
         foreach(rm, ("/tmp/tls_testfile", "/tmp/tls_testfile2"))
 
         # want_tls against a non-TLS server fails with a clear error

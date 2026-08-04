@@ -61,3 +61,80 @@ using XRootD.Wire:
     @test request_name(3501) == "kXR_symlink"
     @test request_name(42) == "kXR_unknown(42)"
 end
+
+using XRootD: Wire
+using XRootD.Wire:
+    NULL_FHANDLE,
+    kXR_attrMeta,
+    kXR_attrProxy,
+    kXR_attrSuper,
+    kXR_bkpexist,
+    kXR_ckpBegin,
+    kXR_ckpCommit,
+    kXR_ckpQuery,
+    kXR_ckpRollback,
+    kXR_ckpXeq,
+    kXR_endsess,
+    kXR_evict,
+    kXR_file,
+    kXR_isDir,
+    kXR_isManager,
+    kXR_isServer,
+    kXR_offline,
+    kXR_other,
+    kXR_poscpend,
+    kXR_readable,
+    kXR_statx,
+    kXR_tlsDemands,
+    kXR_usetcp,
+    kXR_writable,
+    kXR_xset
+
+@testset "Wire constants beyond 0.2.x" begin
+    @test kXR_statx === UInt16(3022)
+    @test kXR_endsess === UInt16(3023)
+
+    # A plain file is the absence of every type bit rather than a bit of
+    # its own, so the flags word must be read by masking, not compared.
+    @test kXR_file === UInt32(0x00)
+    @test kXR_xset === UInt32(0x01)
+    @test kXR_isDir === UInt32(0x02)
+    @test kXR_other === UInt32(0x04)
+    @test kXR_offline === UInt32(0x08)
+    @test kXR_readable | kXR_writable === UInt32(0x30)
+    @test kXR_poscpend === UInt32(0x40)
+    @test kXR_bkpexist === UInt32(0x80)
+
+    @test kXR_ckpBegin === 0x00
+    @test kXR_ckpCommit === 0x01
+    @test kXR_ckpQuery === 0x02
+    @test kXR_ckpRollback === 0x03
+    @test kXR_ckpXeq === 0x04
+
+    # kXR_evict rides in the prepare request's optionX half-word, which is why
+    # it can hold 0x0001 while the options byte's 0x01 means kXR_cancel — and
+    # why it is not the 0x80 that byte spends on kXR_usetcp.
+    @test kXR_evict === UInt16(0x0001)
+    @test kXR_usetcp === 0x80
+
+    # The kXR_protocol reply's role and attribute bits share a word with the
+    # TLS demands, and sit well clear of them.
+    @test kXR_isServer === UInt32(0x00000001)
+    @test kXR_isManager === UInt32(0x00000002)
+    @test kXR_attrMeta === UInt32(0x00000100)
+    @test kXR_attrProxy === UInt32(0x00000200)
+    @test kXR_attrSuper === UInt32(0x00000400)
+    @test (kXR_isServer | kXR_isManager) & kXR_tlsDemands === UInt32(0)
+
+    @test NULL_FHANDLE === (0x00, 0x00, 0x00, 0x00)
+
+    # Server error codes are their own enumeration: they share the 3000-range
+    # with the request opcodes without sharing meaning, so the two name
+    # lookups must not be interchanged.
+    @test Wire.error_name(3011) == "kXR_NotFound"
+    @test Wire.error_name(3018) == "kXR_ItExists"
+    @test Wire.error_name(3003) == "kXR_FileLocked"
+    @test Wire.error_name(3022) == "kXR_error(3022)"   # unassigned, though kXR_statx
+    @test request_name(3011) == "kXR_ping"        # ... and 3011 is an opcode
+    @test Wire.error_name(0) == "kXR_error(0)"
+end

@@ -7,7 +7,7 @@
 using Sockets
 using HTTP: HTTP
 using XRootD: Wire
-using XRootD.Storage: storage_for
+using XRootD.Storage: storage_for, S3Credentials
 using XRootD.Tools: tpc_copy, copyfile, TPC_TTL
 
 """
@@ -133,6 +133,66 @@ end
                 @test first(tpc_copy(a, b)) == :unsupported
             end
             @test isempty(opens)
+        finally
+            close(server)
+        end
+    end
+
+    @testset "an S3 endpoint copying for itself" begin
+        # `x-amz-copy-source` is the S3 shape of the same bargain: the endpoint
+        # moves the bytes and none of them cross this client.
+        seen = Vector{Any}[]
+        handler = function (req::HTTP.Request)
+            push!(seen, Any[req.method, req.target, req.headers])
+            req.method == "PUT" || return HTTP.Response(404, "")
+            # S3 answers a copy it would not make with 200 and an error body.
+            occursin("denied", req.target) &&
+                return HTTP.Response(200, "<Error><Code>AccessDenied</Code></Error>")
+            return HTTP.Response(200, "<CopyObjectResult/>")
+        end
+        server = HTTP.serve!(handler, "127.0.0.1", 0; verbose=false)
+        creds = S3Credentials(;
+            access_key="AKIA", secret_key="secret", session_token="", region="us-east-1"
+        )
+        endpoint = "http://127.0.0.1:$(HTTP.port(server))"
+        try
+            src = storage_for("s3://bucket/in.dat"; creds=creds, endpoint=endpoint)
+            dst = storage_for("s3://bucket/out.dat"; creds=creds, endpoint=endpoint)
+
+            code, msg = tpc_copy(src, dst; overwrite=true)
+            @test code == :ok
+            @test occursin("in.dat", msg) && occursin("out.dat", msg)
+            @test [m for (m, _, _) in seen] == ["PUT"]
+            @test seen[1][2] == "/out.dat"
+            @test HTTP.header(seen[1][3], "x-amz-copy-source") == "/bucket/in.dat"
+
+            # An endpoint that refuses the copy has attempted one and failed:
+            # that is an error, not a missing capability, and the caller must
+            # not paper over it by streaming the object itself.
+            denied = storage_for("s3://bucket/denied.dat"; creds=creds, endpoint=endpoint)
+            code, msg = tpc_copy(src, denied; overwrite=true)
+            @test code == :error
+            @test occursin("in.dat", msg)
+            empty!(seen)
+
+            # Two endpoints, or two credentials, are a transfer rather than a
+            # copy — and must fall back to streaming without asking either one.
+            other = storage_for(
+                "s3://bucket/out.dat"; creds=creds, endpoint="http://s3:9000"
+            )
+            @test first(tpc_copy(src, other)) == :unsupported
+            @test first(
+                tpc_copy(src, storage_for("s3://elsewhere/out.dat"; creds=creds))
+            ) == :unsupported
+            theirs = S3Credentials(;
+                access_key="AKIB", secret_key="secret", session_token="", region="us-east-1"
+            )
+            @test first(
+                tpc_copy(
+                    src, storage_for("s3://bucket/out.dat"; creds=theirs, endpoint=endpoint)
+                ),
+            ) == :unsupported
+            @test isempty(seen)
         finally
             close(server)
         end

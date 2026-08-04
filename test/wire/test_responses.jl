@@ -107,6 +107,51 @@ using XRootD.Wire:
 
         empty = parse_dirlist(UInt8[])
         @test empty.entries == String[] && empty.stats === nothing
+
+        # Without kXR_dcksm there are no tokens to report, and reporting an
+        # empty vector would read as "every entry answered `none`".
+        @test plain.cksums === nothing && ds.cksums === nothing
+        @test empty.cksums === nothing
+
+        @test_throws ArgumentError parse_dirlist(
+            Vector{UInt8}(codeunits(".\n0 0 0 0\nf1\n10 100 0 1700000000\ndir1\0"))
+        )
+    end
+
+    @testset "dcksm dirlist bodies" begin
+        # kXR_dcksm rides on the dstat form: the checksum is appended to the
+        # extended stat line, so the stat fields have to survive it.
+        text = string(
+            ".\n0 0 0 0\n",
+            "f1\n10 100 0 1700000000 1700000001 1700000002 0644 rob users",
+            " [ adler32:0f2c01c7 ]\n",
+            "sub\n11 0 19 1700000000 1700000000 1700000000 0755 rob users",
+            " [ adler32:none ]\0",
+        )
+        d = parse_dirlist(Vector{UInt8}(codeunits(text)))
+        @test d.entries == ["f1", "sub"]
+        @test d.stats[1].size == 100
+        @test d.stats[1].mode == "0644" && d.stats[1].owner == "rob"
+        @test d.stats[2].flags == UInt32(19)
+        @test d.cksums == [
+            (; algorithm="adler32", value="0f2c01c7"), (; algorithm="adler32", value="none")
+        ]
+    end
+
+    @testset "checksum token on a stat line" begin
+        tok = Wire.parse_cksum_token("10 100 0 1700000000 [ crc32c:deadbeef ]")
+        @test tok == (; algorithm="crc32c", value="deadbeef")
+        # A trailing NUL and unpadded brackets are both in circulation.
+        @test Wire.parse_cksum_token("10 0 0 0 [adler32:1]\0").algorithm == "adler32"
+        # A directory has no digest, and the server says so in the value.
+        @test Wire.parse_cksum_token("10 0 19 0 [ adler32:none ]").value == "none"
+        # Anything that is not a well-formed token is absent, not an error: a
+        # server free to append its own fields must not break the listing.
+        @test Wire.parse_cksum_token("10 100 0 1700000000") === nothing
+        @test Wire.parse_cksum_token("10 0 0 0 [ nocolon ]") === nothing
+        @test Wire.parse_cksum_token("10 0 0 0 [ :novalue ]") === nothing
+        @test Wire.parse_cksum_token("10 0 0 0 [ adler32: ]") === nothing
+        @test Wire.parse_cksum_token("10 0 0 0 adler32:1 ]") === nothing
     end
 end
 
@@ -250,5 +295,37 @@ end
         @test Wire.parse_pgwrite_cse(vcat(hdr, off(0), off(8192))) == Int64[0, 8192]
         @test_throws ArgumentError Wire.parse_pgwrite_cse(UInt8[0x00, 0x01])
         @test_throws ArgumentError Wire.parse_pgwrite_cse(vcat(hdr, zeros(UInt8, 7)))
+    end
+end
+
+using XRootD.Wire: parse_bind, parse_checkpoint, parse_statx
+
+@testset "Wire response bodies beyond 0.2.x" begin
+    be32(x) = reverse(reinterpret(UInt8, [UInt32(x)]))
+
+    @testset "checkpoint capacity" begin
+        body = vcat(be32(1 << 20), be32(4096))
+        @test parse_checkpoint(body) == (; capacity=UInt32(1 << 20), used=UInt32(4096))
+        # Trailing bytes a later protocol revision might add are ignored.
+        @test parse_checkpoint(vcat(body, zeros(UInt8, 8))).used == 4096
+        @test_throws ArgumentError parse_checkpoint(zeros(UInt8, 7))
+    end
+
+    @testset "statx flag bytes" begin
+        # One byte per path, in the order asked.
+        flags = parse_statx(UInt8[Wire.kXR_isDir, Wire.kXR_readable, Wire.kXR_offline], 3)
+        @test flags == UInt8[Wire.kXR_isDir, Wire.kXR_readable, Wire.kXR_offline]
+        @test isempty(parse_statx(UInt8[], 0))
+        # The answers are positional, so a count that does not match cannot be
+        # matched back to the paths that produced it.
+        @test_throws ArgumentError parse_statx(UInt8[0x00], 2)
+        @test_throws ArgumentError parse_statx(UInt8[0x00, 0x00], 1)
+    end
+
+    @testset "bind path id" begin
+        @test parse_bind(UInt8[0x07]) == 0x07
+        @test parse_bind(UInt8[0x07, 0xff]) == 0x07
+        # A server may bind the connection without giving it an id of its own.
+        @test parse_bind(UInt8[]) == 0x00
     end
 end

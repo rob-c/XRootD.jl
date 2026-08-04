@@ -62,6 +62,7 @@ const _SIGNED_OPCODES = Set{UInt16}([
     Wire.kXR_fattr,
     Wire.kXR_set,
     Wire.kXR_prepare,
+    Wire.kXR_chkpoint,
 ])
 
 sigver_required(reqid::UInt16) = reqid in _SIGNED_OPCODES

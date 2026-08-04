@@ -13,13 +13,20 @@
 # extended attributes — so an operation is judged by what the server ends up
 # holding, not by the status it chose to return.
 
+using CRC32c
 using Sockets
-using XRootD: Wire
+using XRootD: Tools, Wire
 
-# XErrorCode values (XProtocol.hh). Wire carries no error-code table, and a
-# conformance server has to answer with the code a stock server would.
+# XErrorCode values (XProtocol.hh). A conformance server has to answer with
+# the code a stock server would: EEXIST and ENOTEMPTY both map to
+# kXR_ItExists through XProtocol::mapError, which is what "already exists"
+# and "directory not empty" come back as.
 const FSC_ArgInvalid = 3000
+const FSC_ArgMissing = 3001
+const FSC_ArgTooLong = 3002
 const FSC_InvalidRequest = 3006
+const FSC_ServerError = 3012
+const FSC_ItExists = 3018
 const FSC_NotFound = 3011
 const FSC_Unsupported = 3013
 const FSC_NotFile = 3015
@@ -27,6 +34,9 @@ const FSC_isDirectory = 3016
 const FSC_IOError = 3007
 const FSC_AttrNotFound = 3027
 const FSC_FileNotOpen = 3004
+
+"The compression page size this server reports for a file opened compressed."
+const FSC_CPSIZE = 65536
 
 "Every stat line this namespace emits carries this mtime."
 const FSC_MTIME = 1_700_000_000
@@ -38,7 +48,8 @@ const FSC_FATTR_MAX = 16
 const FSC_OPEN_KNOWN =
     Wire.kXR_compress | Wire.kXR_delete | Wire.kXR_force | Wire.kXR_new |
     Wire.kXR_open_read | Wire.kXR_open_updt | Wire.kXR_refresh | Wire.kXR_mkpath |
-    Wire.kXR_open_apnd | Wire.kXR_retstat | Wire.kXR_open_wrto
+    Wire.kXR_open_apnd | Wire.kXR_retstat | Wire.kXR_open_wrto | Wire.kXR_replica |
+    Wire.kXR_posc | Wire.kXR_nowait | Wire.kXR_seqio | Wire.kXR_async
 
 "The `kXR_open` bits that request write access."
 const FSC_OPEN_WRITE =
@@ -75,12 +86,20 @@ Base.@kwdef mutable struct ConfFS
         "/" => ConfNode(; dir=true, mode=0o755)
     )
     handles::Dict{NTuple{4,UInt8},String} = Dict{NTuple{4,UInt8},String}()
+    checkpoints::Dict{NTuple{4,UInt8},Vector{UInt8}} = Dict{NTuple{4,UInt8},Vector{UInt8}}()
+    sessions_ended::Vector{NTuple{16,UInt8}} = NTuple{16,UInt8}[]
+    directives::Vector{String} = String[]
     next_handle::UInt32 = 0x00000001
     violations::Vector{String} = String[]
     ops::Vector{UInt16} = UInt16[]
     paths::Vector{String} = String[]
     opaque::Vector{String} = String[]   # the CGI on each path, "" when there is none
     logins::Vector{String} = String[]   # the username each connection logged in as
+    # the parameter area of each kXR_gpfile received; the request is refused,
+    # so what it carried is the only thing a test can judge it by
+    gpfiles::Vector{@NamedTuple{options::Int,buffsz::Int}} = @NamedTuple{
+        options::Int, buffsz::Int
+    }[]
     # response shaping
     fail_next::UInt16 = 0x0000        # fail the next request of this kind once
     fail_code::Int = FSC_IOError      # ... with this error code
@@ -103,6 +122,9 @@ function fsc_reset!(fs::ConfFS)
     empty!(fs.paths)
     empty!(fs.opaque)
     empty!(fs.logins)
+    empty!(fs.gpfiles)
+    empty!(fs.sessions_ended)
+    empty!(fs.directives)
     fs.fail_next = 0x0000
     fs.fail_code = FSC_IOError
     fs.wait_next = 0x0000
@@ -173,6 +195,44 @@ end
 function fsc_stat_line(fs::ConfFS, path::AbstractString)
     n = fs.nodes[path]
     return "$(length(fsc_name(path))) $(length(n.data)) $(fsc_flags(n)) $FSC_MTIME"
+end
+
+"""
+The algorithms this server will digest an entry with under `kXR_dcksm`.
+A real server's set is configured, and the reference one rejects everything
+outside it — the answer to `cks.type=md5` here is the same refusal a server
+built without md5 gives.
+"""
+const FSC_CKSUM_ALGOS = ("adler32", "crc32c")
+
+"The `cks.type=` an opaque string selects, or the server's default."
+function fsc_cksum_algo(opaque::AbstractString)
+    for field in split(opaque, '&'; keepempty=false)
+        startswith(field, "cks.type=") && return String(field[10:end])
+    end
+    return "adler32"
+end
+
+"""
+The `kXR_dcksm` form of an entry's line: the extended nine-field stat body —
+`\"<id> <size> <flags> <mtime> <ctime> <atime> <mode> <uid> <gid>\"` — with the
+`\" [ algo:hexdigest ]\"` token appended. A directory has no digest to give,
+and says so with `none` rather than dropping the token.
+"""
+function fsc_dcksm_line(fs::ConfFS, path::AbstractString, algo::AbstractString)
+    n = fs.nodes[path]
+    stat = string(
+        "$(length(fsc_name(path))) $(length(n.data)) $(fsc_flags(n)) $FSC_MTIME ",
+        "$FSC_MTIME $FSC_MTIME $(string(n.mode; base=8, pad=4)) 0 0",
+    )
+    digest = if n.dir
+        "none"
+    elseif algo == "crc32c"
+        string(CRC32c.crc32c(n.data); base=16, pad=8)
+    else
+        string(Tools.adler32(n.data); base=16, pad=8)
+    end
+    return "$stat [ $algo:$digest ]"
 end
 
 "Allocate a file handle for `path`; handles are 4-byte big-endian counters."
@@ -258,14 +318,24 @@ function fsc_serve_dirlist(fs::ConfFS, sock, sid, frame, payload)
     node === nothing && return cs_error(sock, sid, FSC_NotFound, "no such directory $path")
     node.dir || return cs_error(sock, sid, FSC_NotFile, "$path is not a directory")
 
-    dstat = (options & Wire.kXR_dstat) != 0 && !fs.no_stat
+    dcksm = (options & Wire.kXR_dcksm) != 0 && !fs.no_stat
+    # kXR_dcksm implies kXR_dstat whatever the dstat bit says.
+    dstat = ((options & Wire.kXR_dstat) != 0 || dcksm) && !fs.no_stat
+    algo = ""
+    if dcksm
+        algo = fsc_cksum_algo(fs.opaque[end])
+        algo in FSC_CKSUM_ALGOS ||
+            return cs_error(sock, sid, FSC_ServerError, "$algo checksum not supported.")
+    end
     io = IOBuffer()
     # The dstat form opens with the ".\n0 0 0 0\n" sentinel and then alternates
     # name and stat lines; the plain form is bare names. Both are NUL-terminated.
     dstat && print(io, ".\n0 0 0 0\n")
     for name in fsc_children(fs, path)
+        child = path == "/" ? "/$name" : "$path/$name"
         print(io, name, "\n")
-        dstat && print(io, fsc_stat_line(fs, path == "/" ? "/$name" : "$path/$name"), "\n")
+        dcksm && print(io, fsc_dcksm_line(fs, child, algo), "\n")
+        dstat && !dcksm && print(io, fsc_stat_line(fs, child), "\n")
     end
     write(io, 0x00)
     body = take!(io)
@@ -298,7 +368,7 @@ function fsc_serve_open(fs::ConfFS, sock, sid, frame, payload)
     if node !== nothing
         node.dir && return cs_error(sock, sid, FSC_isDirectory, "$path is a directory")
         (options & Wire.kXR_new) != 0 &&
-            return cs_error(sock, sid, FSC_InvalidRequest, "$path already exists")
+            return cs_error(sock, sid, FSC_ItExists, "$path already exists")
         (options & Wire.kXR_delete) != 0 && empty!(node.data)
     else
         (options & FSC_OPEN_WRITE) == 0 &&
@@ -314,12 +384,14 @@ function fsc_serve_open(fs::ConfFS, sock, sid, frame, payload)
     end
 
     body = collect(fsc_handle!(fs, path))
+    compressed = (options & Wire.kXR_compress) != 0
+    if compressed || (options & Wire.kXR_retstat) != 0
+        # handle[4], then the compression descriptor (page size[4] + type[4]);
+        # a zero page size is how the reply says the file is not compressed.
+        body = vcat(body, cs_be32(compressed ? FSC_CPSIZE : 0), cs_be32(0))
+    end
     if (options & Wire.kXR_retstat) != 0
-        # handle[4], then the compression descriptor stock servers send
-        # (page size[4] + type[4]), then the stat line.
-        body = vcat(
-            body, cs_be32(0), cs_be32(0), Vector{UInt8}(codeunits(fsc_stat_line(fs, path)))
-        )
+        body = vcat(body, Vector{UInt8}(codeunits(fsc_stat_line(fs, path))))
     end
     return fsc_reply(fs, sock, sid, Wire.kXR_open, body)
 end
@@ -372,7 +444,7 @@ function fsc_serve_mkdir(fs::ConfFS, sock, sid, frame, payload)
         flag!(fs, "kXR_mkdir: unknown option bits $(string(options; base=16))")
     path = fsc_wantpath(fs, "kXR_mkdir", String(copy(payload)))
     haskey(fs.nodes, path) &&
-        return cs_error(sock, sid, FSC_InvalidRequest, "$path already exists")
+        return cs_error(sock, sid, FSC_ItExists, "$path already exists")
     parent = fsc_parent(path)
     if !haskey(fs.nodes, parent)
         (options & Wire.kXR_mkdirpath) == 0 &&
@@ -404,8 +476,7 @@ function fsc_serve_mv(fs::ConfFS, sock, sid, frame, payload)
     src, dst = fsc_two_paths(fs, frame, payload, "kXR_mv")
     src === nothing && return cs_error(sock, sid, FSC_ArgInvalid, "bad kXR_mv payload")
     haskey(fs.nodes, src) || return cs_error(sock, sid, FSC_NotFound, "no such file $src")
-    haskey(fs.nodes, dst) &&
-        return cs_error(sock, sid, FSC_InvalidRequest, "$dst already exists")
+    haskey(fs.nodes, dst) && return cs_error(sock, sid, FSC_ItExists, "$dst already exists")
     haskey(fs.nodes, fsc_parent(dst)) ||
         return cs_error(sock, sid, FSC_NotFound, "no such directory $(fsc_parent(dst))")
     # Renaming a directory renames everything under it; the namespace is a flat
@@ -448,7 +519,7 @@ function fsc_serve_rmdir(fs::ConfFS, sock, sid, frame, payload)
     node === nothing && return cs_error(sock, sid, FSC_NotFound, "no such directory $path")
     node.dir || return cs_error(sock, sid, FSC_NotFile, "$path is not a directory")
     isempty(fsc_children(fs, path)) ||
-        return cs_error(sock, sid, FSC_InvalidRequest, "$path is not empty")
+        return cs_error(sock, sid, FSC_ItExists, "$path is not empty")
     path == "/" && return cs_error(sock, sid, FSC_InvalidRequest, "cannot remove the root")
     delete!(fs.nodes, path)
     return fsc_reply(fs, sock, sid, Wire.kXR_rmdir)
@@ -495,18 +566,42 @@ const FSC_CONFIG = Dict(
     "version" => "5.2.0", "role" => "server", "sitename" => "conformance"
 )
 
+"The `kXR_query` infotypes that name an open handle instead of a path."
+const FSC_QUERY_HANDLE = (Wire.kXR_Qvisa, Wire.kXR_Qopaqug)
+
 function fsc_serve_query(fs::ConfFS, sock, sid, frame, payload)
     infotype = Wire.get_u16(frame, 5)
-    fsc_zeroed(fs, frame, 7:20, "kXR_query")
+    fsc_zeroed(fs, frame, 7:8, "kXR_query")
+    fsc_zeroed(fs, frame, 13:20, "kXR_query")
+    if infotype in FSC_QUERY_HANDLE
+        # The handle form: the file is named at bytes 9:12, not in the args.
+        isempty(payload) || flag!(fs, "kXR_query $infotype: a handle form with arguments")
+        path = fsc_open_path(fs, frame, "kXR_query"; at=9)
+        path === nothing && return cs_error(sock, sid, FSC_FileNotOpen, "file not open")
+        text = "$path 127.0.0.1:1094 rw"
+        return fsc_reply(
+            fs, sock, sid, Wire.kXR_query, vcat(Vector{UInt8}(codeunits(text)), 0x00)
+        )
+    end
+    fsc_fhandle(frame, 9) == (0x00, 0x00, 0x00, 0x00) ||
+        flag!(fs, "kXR_query: a path form carries a file handle")
     args = String(copy(payload))
     if infotype == Wire.kXR_Qcksum
         path = fsc_wantpath(fs, "kXR_query", args)
         node = get(fs.nodes, path, nothing)
         node === nothing && return cs_error(sock, sid, FSC_NotFound, "no such file $path")
-        text = "adler32 " * string(fsc_adler32(node.data); base=16, pad=8)
+        # `cks.type=` in the CGI picks the digest; without it the server picks.
+        cgi = fs.opaque[end]
+        algo = startswith(cgi, "cks.type=") ? cgi[(length("cks.type=") + 1):end] : "adler32"
+        text = "$algo " * string(fsc_adler32(node.data); base=16, pad=8)
         return fsc_reply(
             fs, sock, sid, Wire.kXR_query, vcat(Vector{UInt8}(codeunits(text)), 0x00)
         )
+    elseif infotype == Wire.kXR_Qckscan
+        path = fsc_wantpath(fs, "kXR_query", args)
+        haskey(fs.nodes, path) ||
+            return cs_error(sock, sid, FSC_NotFound, "no such file $path")
+        return fsc_reply(fs, sock, sid, Wire.kXR_query)
     elseif infotype == Wire.kXR_Qconfig
         # One line per requested keyword, in the order asked.
         lines = [get(FSC_CONFIG, String(k), "0") for k in split(args; keepempty=false)]
@@ -534,8 +629,6 @@ of `[vlen i32][value]`. Get/Set/Del answer
 List answers a NUL-separated name list.
 """
 function fsc_serve_fattr(fs::ConfFS, sock, sid, frame, payload)
-    fsc_fhandle(frame, 5) == (0x00, 0x00, 0x00, 0x00) ||
-        flag!(fs, "kXR_fattr: a path-based request carries a file handle")
     subcode, numattr, options = frame[9], frame[10], frame[11]
     fsc_zeroed(fs, frame, 12:20, "kXR_fattr")
     numattr > FSC_FATTR_MAX &&
@@ -546,7 +639,20 @@ function fsc_serve_fattr(fs::ConfFS, sock, sid, frame, payload)
         flag!(fs, "kXR_fattr: the body has no NUL-terminated path")
         return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
     end
-    path = fsc_wantpath(fs, "kXR_fattr", String(copy(payload[1:(z - 1)])))
+    # Either form names the file: a handle at bytes 5:8 and an empty path, or
+    # a path and a zero handle. Naming it twice, or not at all, is a breach.
+    fh = fsc_fhandle(frame, 5)
+    named = String(copy(payload[1:(z - 1)]))
+    path = if fh == (0x00, 0x00, 0x00, 0x00)
+        fsc_wantpath(fs, "kXR_fattr", named)
+    else
+        isempty(named) || flag!(fs, "kXR_fattr: a handle form also names a path")
+        p = fsc_open_path(fs, frame, "kXR_fattr")
+        p === nothing && return cs_error(sock, sid, FSC_FileNotOpen, "file not open")
+        push!(fs.paths, p)
+        push!(fs.opaque, "")
+        p
+    end
     rest = payload[(z + 1):end]
     node = get(fs.nodes, path, nothing)
     node === nothing && return cs_error(sock, sid, FSC_NotFound, "no such file $path")
@@ -567,68 +673,86 @@ function fsc_serve_fattr(fs::ConfFS, sock, sid, frame, payload)
         flag!(fs, "kXR_fattr: unknown subcode $subcode")
         return cs_error(sock, sid, FSC_ArgInvalid, "bad subcode")
     end
-    numattr == 1 || flag!(fs, "kXR_fattr: numattr is $numattr, want 1")
-    if length(rest) < 3
-        flag!(fs, "kXR_fattr: the attribute vector is $(length(rest)) bytes")
-        return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+    numattr == 0 && flag!(fs, "kXR_fattr: numattr is 0")
+    names = String[]
+    for _ in 1:numattr
+        if length(rest) < 3
+            flag!(fs, "kXR_fattr: the attribute vector is $(length(rest)) bytes")
+            return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+        end
+        Wire.get_u16(rest, 1) == 0x0000 ||
+            flag!(fs, "kXR_fattr: the request's nvec rc is not zero")
+        rest = rest[3:end]
+        z = findfirst(==(0x00), rest)
+        if z === nothing
+            flag!(fs, "kXR_fattr: unterminated attribute name")
+            return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+        end
+        push!(names, String(copy(rest[1:(z - 1)])))
+        rest = rest[(z + 1):end]
     end
-    Wire.get_u16(rest, 1) == 0x0000 ||
-        flag!(fs, "kXR_fattr: the request's nvec rc is not zero")
-    rest = rest[3:end]
-    z = findfirst(==(0x00), rest)
-    if z === nothing
-        flag!(fs, "kXR_fattr: unterminated attribute name")
-        return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
-    end
-    name = String(copy(rest[1:(z - 1)]))
-    rest = rest[(z + 1):end]
 
     if subcode == Wire.kXR_fattrGet
         isempty(rest) ||
-            flag!(fs, "kXR_fattr get: $(length(rest)) trailing bytes after the name")
-        value = get(node.xattr, name, nothing)
+            flag!(fs, "kXR_fattr get: $(length(rest)) trailing bytes after the names")
         # A missing attribute is reported per attribute, not as a request error.
-        value === nothing && return fsc_reply(
-            fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, FSC_AttrNotFound)
-        )
-        return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, 0, value))
+        rcs = [haskey(node.xattr, n) ? 0 : FSC_AttrNotFound for n in names]
+        values = [get(node.xattr, n, UInt8[]) for n in names]
+        return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(names, rcs, values))
     elseif subcode == Wire.kXR_fattrDel
         isempty(rest) ||
-            flag!(fs, "kXR_fattr del: $(length(rest)) trailing bytes after the name")
-        haskey(node.xattr, name) || return fsc_reply(
-            fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, FSC_AttrNotFound)
-        )
-        delete!(node.xattr, name)
-        return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, 0))
+            flag!(fs, "kXR_fattr del: $(length(rest)) trailing bytes after the names")
+        rcs = Int[]
+        for n in names
+            push!(rcs, haskey(node.xattr, n) ? 0 : FSC_AttrNotFound)
+            delete!(node.xattr, n)
+        end
+        return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(names, rcs))
     end
-    if length(rest) < 4
-        flag!(fs, "kXR_fattr set: no value vector")
-        return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+    rcs = Int[]
+    for n in names
+        if length(rest) < 4
+            flag!(fs, "kXR_fattr set: no value vector")
+            return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+        end
+        vlen = cs_i32(rest, 1)
+        if vlen < 0 || vlen + 4 > length(rest)
+            flag!(
+                fs,
+                "kXR_fattr set: value length $vlen but $(length(rest) - 4) bytes followed",
+            )
+            return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
+        end
+        value = Vector{UInt8}(rest[5:(4 + vlen)])
+        rest = rest[(5 + vlen):end]
+        if (options & Wire.kXR_fa_isNew) != 0 && haskey(node.xattr, n)
+            push!(rcs, FSC_ItExists)
+        else
+            node.xattr[n] = value
+            push!(rcs, 0)
+        end
     end
-    vlen = cs_i32(rest, 1)
-    rest = rest[5:end]
-    if vlen != length(rest)
-        flag!(fs, "kXR_fattr set: value length $vlen but $(length(rest)) bytes followed")
-        return cs_error(sock, sid, FSC_ArgInvalid, "bad fattr body")
-    end
-    (options & Wire.kXR_fa_isNew) != 0 &&
-        haskey(node.xattr, name) &&
-        return fsc_reply(
-            fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, FSC_InvalidRequest)
-        )
-    node.xattr[name] = Vector{UInt8}(rest)
-    return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(name, 0))
+    isempty(rest) ||
+        flag!(fs, "kXR_fattr set: $(length(rest)) trailing bytes after the values")
+    return fsc_reply(fs, sock, sid, Wire.kXR_fattr, fsc_fattr_reply(names, rcs))
 end
 
-"One single-attribute reply: `[errcount][numattr][rc][name\\0]` (+ the value on a get)."
-function fsc_fattr_reply(name::AbstractString, rc::Integer, value=nothing)
-    out = UInt8[rc == 0 ? 0x00 : 0x01, 0x01]
-    append!(out, Wire.set_u16!(zeros(UInt8, 2), 1, UInt16(rc)))
-    append!(out, Vector{UInt8}(codeunits(name)))
-    push!(out, 0x00)
-    if value !== nothing
-        append!(out, cs_be32(length(value)))
-        append!(out, value)
+"""
+A `kXR_fattr` reply: `[errcount][numattr]`, the nvec of `[rc][name\\0]` and —
+on a get — the vvec of `[vlen][value]`, one entry per attribute asked for.
+"""
+function fsc_fattr_reply(names::Vector{String}, rcs::Vector{Int}, values=nothing)
+    out = UInt8[UInt8(count(!=(0), rcs)), UInt8(length(names))]
+    for (name, rc) in zip(names, rcs)
+        append!(out, Wire.set_u16!(zeros(UInt8, 2), 1, UInt16(rc)))
+        append!(out, Vector{UInt8}(codeunits(name)))
+        push!(out, 0x00)
+    end
+    if values !== nothing
+        for value in values
+            append!(out, cs_be32(length(value)))
+            append!(out, value)
+        end
     end
     return out
 end
@@ -647,8 +771,16 @@ end
 
 function fsc_serve_prepare(fs::ConfFS, sock, sid, frame, payload)
     options, prty = frame[5], frame[6]
+    optionX = Wire.get_u16(frame, 9)
     fsc_zeroed(fs, frame, 11:20, "kXR_prepare")
     prty == 0x00 || flag!(fs, "kXR_prepare: priority $prty was never requested")
+    # kXR_evict is an optionX bit. A client that set it in the options byte
+    # would be asking for kXR_usetcp, which is a different request entirely.
+    (optionX & ~Wire.kXR_evict) == 0 ||
+        flag!(fs, "kXR_prepare: unknown optionX bits $(string(optionX; base=16))")
+    (optionX & Wire.kXR_evict) != 0 &&
+        (options & Wire.kXR_stage) != 0 &&
+        flag!(fs, "kXR_prepare: staging and evicting the same paths")
     (
         options & ~(
             Wire.kXR_cancel | Wire.kXR_notify | Wire.kXR_noerrs | Wire.kXR_stage |
@@ -671,7 +803,7 @@ function fsc_serve_symlink(fs::ConfFS, sock, sid, frame, payload)
     target === nothing &&
         return cs_error(sock, sid, FSC_ArgInvalid, "bad kXR_symlink payload")
     haskey(fs.nodes, link) &&
-        return cs_error(sock, sid, FSC_InvalidRequest, "$link already exists")
+        return cs_error(sock, sid, FSC_ItExists, "$link already exists")
     fs.nodes[link] = ConfNode(; mode=0o777, link=target)
     return fsc_reply(fs, sock, sid, Wire.kXR_symlink)
 end
@@ -683,8 +815,7 @@ function fsc_serve_link(fs::ConfFS, sock, sid, frame, payload)
     node = get(fs.nodes, old, nothing)
     node === nothing && return cs_error(sock, sid, FSC_NotFound, "no such file $old")
     node.dir && return cs_error(sock, sid, FSC_isDirectory, "$old is a directory")
-    haskey(fs.nodes, new) &&
-        return cs_error(sock, sid, FSC_InvalidRequest, "$new already exists")
+    haskey(fs.nodes, new) && return cs_error(sock, sid, FSC_ItExists, "$new already exists")
     fs.nodes[new] = node                     # a hard link is the same node
     return fsc_reply(fs, sock, sid, Wire.kXR_link)
 end
@@ -748,6 +879,216 @@ function fsc_serve_write(fs::ConfFS, sock, sid, frame, payload)
     return fsc_reply(fs, sock, sid, Wire.kXR_write)
 end
 
+"""
+`kXR_clone`: the destination handle in the parameter area, then one 32-byte
+item per range in the payload (`src_fhandle[4] + reserved[4] + src_offset +
+src_len + dst_offset`). The copy happens here, in the server, which is the
+whole point of the request — the reply is a bare `kXR_ok` carrying no
+per-item outcome.
+
+The refusals are the reference handler's (`src/protocols/root/read/clone.c`):
+no payload is `kXR_ArgMissing`, a length that is not a multiple of the item
+size `kXR_ArgInvalid`, more than `maxClonesz` items `kXR_ArgTooLong`. A
+zero-length item is skipped rather than refused.
+"""
+function fsc_serve_clone(fs::ConfFS, sock, sid, frame, payload)
+    fsc_zeroed(fs, frame, 9:20, "kXR_clone")
+    dst = fsc_fhandle(frame, 5)
+    dstpath = get(fs.handles, dst, nothing)
+    if dstpath === nothing
+        flag!(fs, "kXR_clone: unknown destination fhandle $dst")
+        return cs_error(sock, sid, FSC_FileNotOpen, "destination not open")
+    end
+    isempty(payload) && return cs_error(sock, sid, FSC_ArgMissing, "clone list is missing")
+    length(payload) % Wire.CLONE_ITEM_LEN == 0 ||
+        return cs_error(sock, sid, FSC_ArgInvalid, "malformed clone list")
+    nitems = div(length(payload), Wire.CLONE_ITEM_LEN)
+    nitems > Wire.CLONE_MAXITEMS &&
+        return cs_error(sock, sid, FSC_ArgTooLong, "too many clone items")
+
+    for i in 1:nitems
+        at = Wire.CLONE_ITEM_LEN * (i - 1) + 1
+        src = (payload[at], payload[at + 1], payload[at + 2], payload[at + 3])
+        all(==(0x00), view(payload, (at + 4):(at + 7))) ||
+            flag!(fs, "kXR_clone: reserved item bytes are not zero")
+        srcpath = get(fs.handles, src, nothing)
+        srcpath === nothing &&
+            return cs_error(sock, sid, FSC_FileNotOpen, "source not open")
+        src_off = cs_i64(payload, at + 8)
+        src_len = cs_i64(payload, at + 16)
+        dst_off = cs_i64(payload, at + 24)
+        src_len == 0 && continue
+        (src_off < 0 || dst_off < 0 || src_len < 0) &&
+            return cs_error(sock, sid, FSC_ArgInvalid, "clone offset/length out of range")
+        from = fs.nodes[srcpath].data
+        src_off + src_len > length(from) &&
+            return cs_error(sock, sid, FSC_IOError, "clone reads past the end of $srcpath")
+        into = fs.nodes[dstpath].data
+        need = dst_off + src_len
+        length(into) < need && append!(into, zeros(UInt8, need - length(into)))
+        into[(dst_off + 1):need] = from[(src_off + 1):(src_off + src_len)]
+    end
+    return fsc_reply(fs, sock, sid, Wire.kXR_clone)
+end
+
+"""
+`kXR_gpfile`: record the options and buffer size the request carried, then
+refuse it. No server implements the opcode — upstream's own request struct
+is marked wrong — so `kXR_Unsupported` is the conformant answer, and what
+the client put in the parameter area is the only thing worth judging.
+"""
+function fsc_serve_gpfile(fs::ConfFS, sock, sid, frame, payload)
+    fsc_zeroed(fs, frame, 9:16, "kXR_gpfile")
+    fsc_wantpath(fs, "kXR_gpfile", String(copy(payload)))
+    push!(fs.gpfiles, (; options=cs_i32(frame, 5), buffsz=cs_i32(frame, 17)))
+    return cs_error(sock, sid, FSC_Unsupported, "kXR_gpfile is not supported")
+end
+
+"""
+`kXR_close`: the handle, then an optional verified size at bytes 9:16. A
+non-zero size that does not match is EEXIST-free failure — the server
+rejects the close AND removes the file, which is what makes a size-verified
+close all-or-nothing.
+"""
+function fsc_serve_close(fs::ConfFS, sock, sid, frame)
+    fsc_zeroed(fs, frame, 17:20, "kXR_close")
+    fh = fsc_fhandle(frame, 5)
+    fsize = cs_i64(frame, 9)
+    fsize < 0 && flag!(fs, "kXR_close: negative fsize $fsize")
+    path = get(fs.handles, fh, nothing)
+    if path === nothing
+        flag!(fs, "kXR_close: unknown fhandle $fh")
+        return cs_error(sock, sid, FSC_FileNotOpen, "file not open")
+    end
+    delete!(fs.handles, fh)
+    delete!(fs.checkpoints, fh)
+    if fsize != 0 && fsize != length(fs.nodes[path].data)
+        delete!(fs.nodes, path)
+        return cs_error(sock, sid, FSC_IOError, "$path is not $fsize bytes")
+    end
+    return fsc_reply(fs, sock, sid, Wire.kXR_close)
+end
+
+"""
+`kXR_statx`: newline-separated paths in the payload, one flags byte per path
+in the reply, in the order asked. A path that is not there answers
+`kXR_offline` — the byte form has no way to say "no such file".
+"""
+function fsc_serve_statx(fs::ConfFS, sock, sid, frame, payload)
+    fsc_zeroed(fs, frame, 5:20, "kXR_statx")
+    isempty(payload) && flag!(fs, "kXR_statx: no paths")
+    out = UInt8[]
+    for raw in split(String(copy(payload)), '\n'; keepempty=false)
+        path = fsc_wantpath(fs, "kXR_statx", raw)
+        node = get(fs.nodes, path, nothing)
+        push!(out, node === nothing ? UInt8(Wire.kXR_offline) : UInt8(fsc_flags(node)))
+    end
+    return fsc_reply(fs, sock, sid, Wire.kXR_statx, out)
+end
+
+"""
+`kXR_set`: the directive text in the payload — `\"appid <name>\"` is the one
+every client sends. Stock answers with an empty body.
+"""
+function fsc_serve_set(fs::ConfFS, sock, sid, frame, payload)
+    fsc_zeroed(fs, frame, 5:20, "kXR_set")
+    isempty(payload) && flag!(fs, "kXR_set: no directive")
+    push!(fs.directives, String(copy(payload)))
+    return fsc_reply(fs, sock, sid, Wire.kXR_set)
+end
+
+"`kXR_endsess`: the 16-byte session id at bytes 5:20 and no payload."
+function fsc_serve_endsess(fs::ConfFS, sock, sid, frame, payload)
+    isempty(payload) || flag!(fs, "kXR_endsess: $(length(payload)) payload bytes")
+    push!(fs.sessions_ended, ntuple(i -> frame[4 + i], 16))
+    return fsc_reply(fs, sock, sid, Wire.kXR_endsess)
+end
+
+"""
+`kXR_chkpoint`: the handle at bytes 5:8, bytes 9:19 reserved and the subcode
+at byte 20 — the LAST byte of the parameter area, not the first.
+
+`kXR_ckpXeq` frames only the embedded 24-byte request header in `dlen`; that
+request's own data follows OUTSIDE the frame, on the writev rule, and is read
+here rather than left in the stream for the next request to trip over.
+"""
+function fsc_serve_chkpoint(fs::ConfFS, sock, sid, frame, payload)
+    fsc_zeroed(fs, frame, 9:19, "kXR_chkpoint")
+    subcode = frame[20]
+    fh = fsc_fhandle(frame, 5)
+    path = get(fs.handles, fh, nothing)
+    path === nothing && return cs_error(sock, sid, FSC_FileNotOpen, "file not open")
+
+    if subcode == Wire.kXR_ckpXeq
+        return fsc_serve_ckpxeq(fs, sock, sid, fh, path, payload)
+    end
+    isempty(payload) || flag!(fs, "kXR_chkpoint $subcode: $(length(payload)) payload bytes")
+
+    if subcode == Wire.kXR_ckpBegin
+        haskey(fs.checkpoints, fh) &&
+            return cs_error(sock, sid, FSC_InvalidRequest, "a checkpoint is already open")
+        fs.checkpoints[fh] = copy(fs.nodes[path].data)
+        return fsc_reply(fs, sock, sid, Wire.kXR_chkpoint)
+    elseif subcode == Wire.kXR_ckpCommit
+        haskey(fs.checkpoints, fh) ||
+            return cs_error(sock, sid, FSC_InvalidRequest, "no checkpoint is open")
+        delete!(fs.checkpoints, fh)
+        return fsc_reply(fs, sock, sid, Wire.kXR_chkpoint)
+    elseif subcode == Wire.kXR_ckpRollback
+        snapshot = get(fs.checkpoints, fh, nothing)
+        snapshot === nothing &&
+            return cs_error(sock, sid, FSC_InvalidRequest, "no checkpoint is open")
+        fs.nodes[path].data = snapshot
+        delete!(fs.checkpoints, fh)
+        return fsc_reply(fs, sock, sid, Wire.kXR_chkpoint)
+    elseif subcode == Wire.kXR_ckpQuery
+        used = length(get(fs.checkpoints, fh, UInt8[]))
+        return fsc_reply(
+            fs, sock, sid, Wire.kXR_chkpoint, vcat(cs_be32(FSC_CKP_CAPACITY), cs_be32(used))
+        )
+    end
+    flag!(fs, "kXR_chkpoint: unknown subcode $subcode")
+    return cs_error(sock, sid, FSC_ArgInvalid, "bad checkpoint subcode")
+end
+
+"What a checkpoint on this server may hold, in bytes."
+const FSC_CKP_CAPACITY = 1 << 20
+
+function fsc_serve_ckpxeq(fs::ConfFS, sock, sid, fh, path, payload)
+    haskey(fs.checkpoints, fh) ||
+        return cs_error(sock, sid, FSC_InvalidRequest, "no checkpoint is open")
+    if length(payload) != 24
+        flag!(fs, "kXR_ckpXeq: dlen is $(length(payload)), want the 24-byte header alone")
+        return cs_error(sock, sid, FSC_ArgInvalid, "bad checkpoint body")
+    end
+    inner = Wire.get_u16(payload, 3)
+    inner in (Wire.kXR_write, Wire.kXR_pgwrite, Wire.kXR_truncate) ||
+        flag!(fs, "kXR_ckpXeq: $(Wire.request_name(inner)) cannot be undone")
+    fsc_fhandle(payload, 5) == fh ||
+        flag!(fs, "kXR_ckpXeq: the embedded request names another handle")
+    dlen = cs_i32(payload, 21)
+    trail = dlen > 0 ? read(sock, dlen) : UInt8[]
+    length(trail) == dlen || throw(EOFError())
+
+    node = fs.nodes[path]
+    if inner == Wire.kXR_truncate
+        size = cs_i64(payload, 9)
+        if size <= length(node.data)
+            resize!(node.data, size)
+        else
+            append!(node.data, zeros(UInt8, size - length(node.data)))
+        end
+    else
+        offset = cs_i64(payload, 9)
+        offset < 0 && flag!(fs, "kXR_ckpXeq: negative offset $offset")
+        need = offset + length(trail)
+        length(node.data) < need &&
+            append!(node.data, zeros(UInt8, need - length(node.data)))
+        node.data[(offset + 1):need] = trail
+    end
+    return fsc_reply(fs, sock, sid, Wire.kXR_chkpoint)
+end
+
 # ---- connection ----
 
 function fsc_serve_conn(fs::ConfFS, sock)
@@ -804,15 +1145,19 @@ function fsc_serve_conn(fs::ConfFS, sock)
                     fsc_reply(fs, sock, sid, Wire.kXR_sync)
                 end
             elseif rid == Wire.kXR_close
-                fsc_zeroed(fs, frame, 9:20, "kXR_close")
-                fh = fsc_fhandle(frame, 5)
-                if !haskey(fs.handles, fh)
-                    flag!(fs, "kXR_close: unknown fhandle $fh")
-                    cs_error(sock, sid, FSC_FileNotOpen, "file not open")
-                else
-                    delete!(fs.handles, fh)
-                    fsc_reply(fs, sock, sid, Wire.kXR_close)
-                end
+                fsc_serve_close(fs, sock, sid, frame)
+            elseif rid == Wire.kXR_clone
+                fsc_serve_clone(fs, sock, sid, frame, payload)
+            elseif rid == Wire.kXR_gpfile
+                fsc_serve_gpfile(fs, sock, sid, frame, payload)
+            elseif rid == Wire.kXR_statx
+                fsc_serve_statx(fs, sock, sid, frame, payload)
+            elseif rid == Wire.kXR_chkpoint
+                fsc_serve_chkpoint(fs, sock, sid, frame, payload)
+            elseif rid == Wire.kXR_set
+                fsc_serve_set(fs, sock, sid, frame, payload)
+            elseif rid == Wire.kXR_endsess
+                fsc_serve_endsess(fs, sock, sid, frame, payload)
             elseif rid == Wire.kXR_protocol
                 # Re-asked after bring-up: the same 5.2.0 server answer.
                 Wire.get_u32(frame, 5) >= 0x00000310 ||

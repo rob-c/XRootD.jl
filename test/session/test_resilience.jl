@@ -96,6 +96,36 @@ function start_flaky_server()
     return port, attempts
 end
 
+"A mock that severs every kXR_stat, however many times it is asked."
+function start_severing_server()
+    server = listen(ip"127.0.0.1", 0)
+    _, port = getsockname(server)
+    attempts = Ref(0)
+    @async while isopen(server)
+        local sock
+        try
+            sock = accept(server)
+        catch
+            break
+        end
+        @async begin
+            try
+                serve_bringup(sock)
+                while isopen(sock)
+                    frame, _ = read_request(sock)
+                    if req_id(frame) == Wire.kXR_stat
+                        attempts[] += 1
+                        close(sock)
+                        break
+                    end
+                end
+            catch
+            end
+        end
+    end
+    return server, Int(port), attempts
+end
+
 "A mock that counts kXR_ping requests (for the keepalive test)."
 function start_ping_counting_server()
     server = listen(ip"127.0.0.1", 0)
@@ -166,6 +196,30 @@ end
             gone.conn = dead_connection()
             st, _ = stat(gone, "/x")
             @test isError(st)
+        end
+    end
+
+    @testset "a peer that always fails is asked a bounded number of times" begin
+        # The window alone is not a budget. A server that severs in a
+        # millisecond fits hundreds of attempts inside a 30 s patience window,
+        # and every one of them lands on a server that is already in trouble.
+        # The attempt count is what actually bounds it.
+        server, port, attempts = start_severing_server()
+        try
+            withenv(
+                "XRDC_MAX_RETRIES" => "2",
+                "XRDC_RETRY_BASE_MS" => "1",
+                "XRDC_MAX_STALL_MS" => "30000",
+            ) do
+                fs = FileSystem("root://127.0.0.1:$port")
+                t0 = time()
+                st, _ = stat(fs, "/x")
+                @test isError(st)
+                @test attempts[] == 3                # the first try, plus two retries
+                @test time() - t0 < 5.0              # bounded by the count, not the window
+            end
+        finally
+            close(server)
         end
     end
 

@@ -197,14 +197,26 @@ end
 Bring a session up against an [`AuthServer`](@ref), returning `(conn, err)`:
 a credential the server refuses fails the bring-up, and the failure is the
 result the test is after.
+
+`prompter` answers any credential the client cannot find; the default declines
+every request, so a test that means to authenticate anonymously does so
+whether or not a terminal happens to be attached. Nothing is remembered
+between bring-ups.
 """
-function auth_bringup(port::Int; kwargs...)
-    conn = try
-        Session.connect("127.0.0.1", port; x509=false, kwargs...)
-    catch err
-        return nothing, err
+function auth_bringup(port::Int; prompter=(_ -> nothing), kwargs...)
+    previous = Session.prompt_credentials!(prompter)
+    Session.forget_credentials!()
+    try
+        conn = try
+            Session.connect("127.0.0.1", port; x509=false, kwargs...)
+        catch err
+            return nothing, err
+        end
+        return conn, nothing
+    finally
+        Session.prompt_credentials!(previous)
+        Session.forget_credentials!()
     end
-    return conn, nothing
 end
 
 """

@@ -23,12 +23,14 @@ export storage_for,
     storage_stat,
     storage_read,
     storage_write,
+    storage_open,
     storage_list,
     storage_remove,
     storage_mkdir,
     storage_move,
     storage_copy,
-    StorageInfo
+    StorageInfo,
+    StorageError
 
 "Backend-neutral metadata for a storage object."
 struct StorageInfo
@@ -46,8 +48,20 @@ Abstract supertype of storage backends. Concrete backends implement
 """
 abstract type Backend end
 
-"Transfer granularity, matching the copy engine's read size."
+"Default transfer granularity, matching the copy engine's read size."
 const IO_CHUNK = 1 << 20
+
+"""
+    io_chunk() -> Int
+
+Bytes moved per read or write: `\$XRD_CPCHUNKSIZE` when a site has tuned it,
+[`IO_CHUNK`](@ref) otherwise. A value of zero — or one that does not parse —
+is not honoured, because a chunk of no bytes is a loop that never advances.
+"""
+function io_chunk()
+    n = Session.env_int("XRD_CPCHUNKSIZE", IO_CHUNK)
+    return n > 0 ? n : IO_CHUNK
+end
 
 """
     fill_chunk!(source, buf, n) -> Int
@@ -74,7 +88,7 @@ end
     pump(source, sink, length=nothing) -> Int
 
 Move `length` bytes (or everything up to end of stream) from `source` to
-`sink` in [`IO_CHUNK`](@ref) steps, returning the byte count.
+`sink` in [`io_chunk`](@ref) steps, returning the byte count.
 
 The chunking is load-bearing, not an optimisation: reading a
 `Base.BufferStream` to end of stream parks until the writer closes it and
@@ -84,10 +98,11 @@ Bounded reads keep the pipe draining.
 """
 function pump(source::IO, sink::IO, length=nothing)
     remaining = length === nothing ? typemax(Int) : Int(length)
-    buf = Vector{UInt8}(undef, min(IO_CHUNK, remaining))
+    chunk = io_chunk()
+    buf = Vector{UInt8}(undef, min(chunk, remaining))
     total = 0
     while remaining > 0
-        n = fill_chunk!(source, buf, min(IO_CHUNK, remaining))
+        n = fill_chunk!(source, buf, min(chunk, remaining))
         n == 0 && break
         GC.@preserve buf unsafe_write(sink, pointer(buf), UInt(n))
         total += n
@@ -108,7 +123,77 @@ function drain(source::IO, length=nothing)
     return take!(buf)
 end
 
+"""
+Bytes of backlog a producer may leave in a pipe before it is held back. A
+`Base.BufferStream` has no bound of its own, so a producer faster than its
+consumer — which, against a network, is every producer — turns the pipe into a
+copy of the object in memory. This is what that costs instead.
+"""
+const STREAM_HIGH_WATER = 8 << 20
+
+"""
+    backpressure!(pipe, high_water=STREAM_HIGH_WATER; consumer=nothing)
+
+Hold the caller back while `pipe` holds more than `high_water` bytes nobody has
+read yet.
+
+`consumer`, when given, is the task draining the pipe: a consumer that has
+stopped is never going to catch up, and waiting for it to would be a deadlock
+rather than a delay.
+"""
+function backpressure!(
+    pipe::IO, high_water::Integer=STREAM_HIGH_WATER; consumer::Union{Task,Nothing}=nothing
+)
+    pipe isa Base.BufferStream || return nothing
+    while isopen(pipe) && bytesavailable(pipe) > high_water
+        consumer !== nothing && istaskdone(consumer) && break
+        sleep(0.001)
+    end
+    return nothing
+end
+
+"""
+    ranged_body(status, body, offset, length) -> (Symbol, AbstractVector{UInt8})
+
+The bytes a ranged `GET` actually asked for, and whether they all arrived:
+`:ok` with exactly the requested range, or `:truncated` with the short prefix
+that did.
+
+Two things stand between a `Range:` header and the bytes a caller wanted, and
+neither announces itself:
+
+  - An endpoint that does not implement ranges answers `200` with the *whole*
+    object. Handing that back is not a partial success, it is the wrong bytes
+    at the wrong offset, so the requested window is cut out of it here.
+  - A body shorter than the range is a transfer that stopped rather than an
+    object that ended — over a network that drops connections, the single
+    most likely way to end up with a silently short file.
+
+An over-long body is clipped to what was asked for; a server that answers
+generously is not a reason to write bytes the caller has no room for.
+"""
+function ranged_body(status::Integer, body::AbstractVector{UInt8}, offset::Integer, length)
+    bytes = if status == 200 && offset > 0
+        # Range ignored: the object arrived from byte zero.
+        start = Int(offset) + 1
+        if start > Base.length(body)
+            view(body, 1:0)
+        else
+            view(body, start:Base.length(body))
+        end
+    else
+        view(body, 1:Base.length(body))
+    end
+    length === nothing && return :ok, bytes
+    want = Int(length)
+    Base.length(bytes) < want && return :truncated, bytes
+    return :ok, view(bytes, 1:want)
+end
+
 include("url.jl")
+# Ahead of the backends: each one adds its own handle to the stream layer's
+# interface, and a subtype needs its supertype to already exist.
+include("stream.jl")
 include("local.jl")
 include("xrootd.jl")
 include("web.jl")
@@ -150,8 +235,13 @@ end
     storage_for(url::AbstractString; kwargs...) -> Backend
 
 Select and construct the backend for `url` by scheme: `root(s)://` →
-XRootD, `http(s)://`/`dav(s)://` → HTTP/WebDAV, `s3(s)://` → S3, anything
-else → local filesystem.
+XRootD, `http(s)://`/`dav(s)://` → HTTP/WebDAV, `s3(s)://` → S3, a string with
+no `scheme://` at all → local filesystem.
+
+A scheme this client does not speak raises `ArgumentError` rather than falling
+back to the local filesystem: `rooot://host//data` is a typo, and answering it
+by looking for a local directory of that name turns one mistake into a
+puzzling one.
 
 Credential keywords (`token`, `cert`/`key`, `keytab`, `insecure_tls`, …) are
 filtered to what the selected backend supports; see [`_BACKEND_OPTS`](@ref).
@@ -165,9 +255,17 @@ function storage_for(url::AbstractString; kwargs...)
         return WebBackend(u; backend_opts(opts, :web)...)
     elseif u.scheme in ("s3", "s3s")
         return S3Backend(u; backend_opts(opts, :s3)...)
-    else
+    elseif u.scheme == "file"
         backend_opts(opts, :file)
         return LocalBackend(u)
+    else
+        throw(
+            ArgumentError(
+                "$(u.scheme):// is not a scheme this client speaks (in $(repr(url))); " *
+                "use root://, roots://, http://, https://, dav://, davs://, s3://, " *
+                "s3s://, or a plain local path",
+            ),
+        )
     end
 end
 
@@ -235,7 +333,5 @@ function storage_copy end
 
 # S3 has no directories: a key prefix exists as soon as an object uses it.
 storage_mkdir(::S3Backend) = :ok
-storage_move(::S3Backend, ::AbstractString; overwrite::Bool=false) = :unsupported
-storage_copy(::S3Backend, ::AbstractString; overwrite::Bool=false) = :unsupported
 
 end # module Storage

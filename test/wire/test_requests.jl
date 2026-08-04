@@ -273,6 +273,62 @@ using CRC32c: crc32c
         @test pw[29:30] == UInt8[0xde, 0xad]
         @test crc == crc32c(UInt8[0xde, 0xad])
     end
+
+    @testset "clone" begin
+        src = (0x0a, 0x0b, 0x0c, 0x0d)
+        c = encode(
+            Wire.CloneRequest(
+                fh,
+                Wire.CloneItem[
+                    (;
+                        fhandle=src,
+                        src_offset=Int64(0),
+                        src_len=Int64(16),
+                        dst_offset=Int64(4096),
+                    ),
+                    (;
+                        fhandle=src,
+                        src_offset=Int64(8192),
+                        src_len=Int64(1),
+                        dst_offset=Int64(0),
+                    ),
+                ],
+            ),
+            UInt16(9),
+        )
+        @test c[3:4] == UInt8[0x0b, 0xd8]        # kXR_clone (3032)
+        @test c[5:8] == UInt8[1, 2, 3, 4]        # destination handle
+        @test all(==(0x00), c[9:20])             # reserved
+        @test c[21:24] == UInt8[0, 0, 0, 64]     # dlen = 2 items x 32
+        @test c[25:28] == UInt8[0x0a, 0x0b, 0x0c, 0x0d]
+        @test all(==(0x00), c[29:32])            # per-item reserved
+        @test Wire.get_u64(c, 33) == 0           # src_offset
+        @test Wire.get_u64(c, 41) == 16          # src_len
+        @test Wire.get_u64(c, 49) == 4096        # dst_offset
+        @test c[57:60] == UInt8[0x0a, 0x0b, 0x0c, 0x0d]
+        @test Wire.get_u64(c, 65) == 8192
+        @test length(c) == 24 + 64
+
+        item(off) =
+            (; fhandle=src, src_offset=Int64(off), src_len=Int64(1), dst_offset=Int64(off))
+        @test_throws ArgumentError Wire.CloneRequest(fh, Wire.CloneItem[])
+        @test_throws ArgumentError Wire.CloneRequest(
+            fh, Wire.CloneItem[item(i) for i in 0:(Wire.CLONE_MAXITEMS)]
+        )
+        @test_throws ArgumentError Wire.CloneRequest(fh, Wire.CloneItem[item(-1)])
+        @test_throws ArgumentError Wire.CloneRequest(
+            fh,
+            Wire.CloneItem[(;
+                fhandle=src, src_offset=Int64(0), src_len=Int64(-1), dst_offset=Int64(0)
+            )],
+        )
+
+        # Like kXR_readv, a clone names handles a reopen cannot re-aim: the
+        # source handle lives in the payload, not in the header field
+        # `with_fhandle` rewrites.
+        one = Wire.CloneRequest(fh, Wire.CloneItem[item(0)])
+        @test Wire.with_fhandle(one, src).dst_fhandle == fh
+    end
 end
 
 using XRootD.Wire:
@@ -341,6 +397,20 @@ using XRootD.Wire:
         @test p[5] == kXR_stage
         @test String(p[25:end]) == "/a\n/b"
     end
+
+    @testset "gpfile" begin
+        g = encode(Wire.GPFileRequest("/f"; options=2, buffsz=65536), UInt16(5))
+        @test g[3:4] == UInt8[0x0b, 0xbd]        # kXR_gpfile (3005)
+        @test Wire.get_u32(g, 5) == 2            # options
+        @test all(==(0x00), g[9:16])             # reserved[8]
+        @test Wire.get_u32(g, 17) == 65536       # buffsz
+        @test Wire.get_u32(g, 21) == 2
+        @test String(g[25:end]) == "/f"
+        # The options field is signed on the wire, and the sign has to survive.
+        neg = encode(Wire.GPFileRequest("/f"; options=-1), UInt16(5))
+        @test neg[5:8] == UInt8[0xff, 0xff, 0xff, 0xff]
+        @test Wire.with_cgi(Wire.GPFileRequest("/f"), "a=1").path == "/f?a=1"
+    end
 end
 
 @testset "opaque data can be merged onto a request's path" begin
@@ -392,4 +462,206 @@ end
 
     @test RmRequest(src).path isa String
     @test MvRequest(src, dst).dst isa String
+end
+
+using XRootD.Wire:
+    ChkPointRequest,
+    CloseRequest,
+    EndsessRequest,
+    QueryRequest,
+    ReadRequest,
+    SetRequest,
+    StatxRequest,
+    SyncRequest,
+    TruncateRequest,
+    WriteRequest,
+    kXR_ckpBegin,
+    kXR_ckpRollback,
+    kXR_ckpXeq,
+    kXR_fattrList,
+    kXR_Qcksum,
+    kXR_Qvisa,
+    kXR_write
+
+@testset "requests that name an open file handle" begin
+    fh = (0xde, 0xad, 0xbe, 0xef)
+
+    @testset "kXR_close carries a verified size" begin
+        # Bytes 9:16 are the size the close must agree with; 17:20 stay zero.
+        p = encode(CloseRequest(fh; fsize=1024), UInt16(1))
+        @test p[3:4] == UInt8[0x0b, 0xbb]                 # kXR_close (3003)
+        @test Tuple(p[5:8]) == fh
+        @test p[9:16] == UInt8[0, 0, 0, 0, 0, 0, 0x04, 0x00]
+        @test all(==(0x00), p[17:24])
+        # The default suppresses the check rather than asking for a zero-byte file.
+        @test all(==(0x00), encode(CloseRequest(fh), UInt16(1))[9:24])
+    end
+
+    @testset "kXR_query can name a handle instead of a path" begin
+        # The handle sits at parameter bytes 9:12, past a two-byte hole.
+        p = encode(QueryRequest(kXR_Qvisa; fhandle=fh), UInt16(1))
+        @test p[3:4] == UInt8[0x0b, 0xb9]                 # kXR_query (3001)
+        @test Wire.get_u16(p, 5) == kXR_Qvisa
+        @test all(==(0x00), p[7:8])
+        @test Tuple(p[9:12]) == fh
+        @test Wire.get_u32(p, 21) == 0                    # no arguments
+        # The path form leaves the handle zero.
+        @test all(==(0x00), encode(QueryRequest(kXR_Qcksum, "/f"), UInt16(1))[9:12])
+    end
+
+    @testset "kXR_chkpoint puts its subcode in the last parameter byte" begin
+        p = encode(ChkPointRequest(fh, kXR_ckpBegin), UInt16(7))
+        @test p[3:4] == UInt8[0x0b, 0xc4]                 # kXR_chkpoint (3012)
+        @test Tuple(p[5:8]) == fh
+        @test all(==(0x00), p[9:19])                      # reserved
+        @test p[20] == kXR_ckpBegin
+        @test Wire.get_u32(p, 21) == 0
+        @test encode(ChkPointRequest(fh, kXR_ckpRollback), UInt16(7))[20] == kXR_ckpRollback
+    end
+
+    @testset "kXR_ckpXeq frames the embedded header alone" begin
+        inner = WriteRequest(fh, Int64(16), UInt8[0xaa, 0xbb])
+        p = encode(Wire.checkpoint_exec(fh, inner), UInt16(7))
+        @test p[20] == kXR_ckpXeq
+        # dlen counts the 24-byte embedded header and nothing else; the
+        # embedded request's own data trails outside the frame, on the same
+        # rule kXR_writev follows.
+        @test Wire.get_u32(p, 21) == Wire.REQUEST_HDRLEN
+        @test length(p) == 24 + Wire.REQUEST_HDRLEN + 2
+        embedded = p[25:(24 + Wire.REQUEST_HDRLEN)]
+        @test Wire.get_u16(embedded, 3) == kXR_write
+        @test Tuple(embedded[5:8]) == fh
+        @test Wire.get_u32(embedded, 21) == 2             # the inner dlen
+        @test p[(end - 1):end] == UInt8[0xaa, 0xbb]
+        # The embedded header carries no stream id: the answer comes back on
+        # the outer frame's.
+        @test Wire.get_u16(embedded, 1) == 0
+
+        @test Wire.checkpoint_exec(fh, TruncateRequest("", Int64(4), fh)) isa
+            ChkPointRequest
+        @test_throws ArgumentError Wire.checkpoint_exec(fh, StatRequest("/f"))
+    end
+
+    @testset "kXR_statx, kXR_set and kXR_endsess" begin
+        p = encode(StatxRequest(["/a", "/b"]), UInt16(1))
+        @test p[3:4] == UInt8[0x0b, 0xce]                 # kXR_statx (3022)
+        @test all(==(0x00), p[5:20])
+        @test String(p[25:end]) == "/a\n/b"
+
+        p = encode(SetRequest("appid test"), UInt16(1))
+        @test p[3:4] == UInt8[0x0b, 0xca]                 # kXR_set (3018)
+        @test String(p[25:end]) == "appid test"
+
+        id = UInt8[i for i in 1:16]
+        p = encode(EndsessRequest(id), UInt16(1))
+        @test p[3:4] == UInt8[0x0b, 0xcf]                 # kXR_endsess (3023)
+        @test p[5:20] == id
+        @test Wire.get_u32(p, 21) == 0
+        # A short id is right-padded, an over-long one is refused.
+        @test EndsessRequest(UInt8[0x01]).sessid[2] == 0x00
+        @test_throws ArgumentError EndsessRequest(zeros(UInt8, 17))
+        @test all(==(0x00), encode(EndsessRequest(), UInt16(1))[5:20])
+    end
+end
+
+@testset "a request can be re-aimed at a reopened handle" begin
+    # A file handle is valid only on the connection it was opened on, so a
+    # request replayed after a reopen has to name the new one.
+    fh = (0x11, 0x22, 0x33, 0x44)
+    for req in (
+        ReadRequest(Wire.NULL_FHANDLE, Int64(8), Int32(16)),
+        WriteRequest(Wire.NULL_FHANDLE, Int64(8), UInt8[0x01]),
+        PgReadRequest(Wire.NULL_FHANDLE, Int64(0), Int32(4096)),
+        PgWriteRequest(Wire.NULL_FHANDLE, Int64(0), UInt8[0x01]),
+        SyncRequest(Wire.NULL_FHANDLE),
+        CloseRequest(Wire.NULL_FHANDLE; fsize=3),
+        StatRequest(""; fhandle=Wire.NULL_FHANDLE),
+        TruncateRequest("", Int64(2), Wire.NULL_FHANDLE),
+        QueryRequest(kXR_Qvisa; fhandle=Wire.NULL_FHANDLE),
+        FattrRequest(kXR_fattrList, ""; fhandle=Wire.NULL_FHANDLE),
+        ChkPointRequest(Wire.NULL_FHANDLE, kXR_ckpBegin),
+    )
+        aimed = Wire.with_fhandle(req, fh)
+        @test aimed.fhandle == fh
+        @test Wire.requestid(aimed) == Wire.requestid(req)
+    end
+
+    # The rest of the request survives the re-aiming.
+    r = Wire.with_fhandle(ReadRequest(Wire.NULL_FHANDLE, Int64(8), Int32(16)), fh)
+    @test r.offset == 8 && r.rlen == 16
+    @test Wire.with_fhandle(CloseRequest(Wire.NULL_FHANDLE; fsize=3), fh).fsize == 3
+
+    # A request that names no handle is handed back untouched — kXR_readv
+    # among them, because its segments may name several files at once.
+    @test Wire.with_fhandle(PingRequest(), fh) isa PingRequest
+    @test Wire.with_fhandle(RmRequest("/f"), fh).path == "/f"
+    rv = ReadVRequest([(fhandle=Wire.NULL_FHANDLE, offset=Int64(0), rlen=Int32(8))])
+    @test Wire.with_fhandle(rv, fh).segments[1].fhandle == Wire.NULL_FHANDLE
+end
+
+@testset "requests routed over a bound data path" begin
+    fh = (0x0a, 0x0b, 0x0c, 0x0d)
+
+    @testset "kXR_bind names the session to join" begin
+        id = UInt8[i for i in 1:16]
+        p = encode(Wire.BindRequest(id), UInt16(3))
+        @test p[3:4] == UInt8[0x0b, 0xd0]                 # kXR_bind (3024)
+        @test p[5:20] == id
+        @test Wire.get_u32(p, 21) == 0
+        @test Wire.decode_bind(UInt8[0x02]) == 0x02
+        # A reply naming path 0 names the control link, which would send the
+        # data straight back down the link the bind was meant to relieve.
+        @test_throws ArgumentError Wire.decode_bind(UInt8[0x00])
+        @test_throws ArgumentError Wire.decode_bind(UInt8[])
+    end
+
+    @testset "kXR_read asks for its answer on the path" begin
+        r = encode(ReadRequest(fh, Int64(1024), Int32(4096); pathid=0x03), UInt16(6))
+        # The header is unchanged; the id rides in the optional arguments,
+        # whose length is what dlen counts (alen = 8, no pre-read hints).
+        @test Tuple(r[5:8]) == fh
+        @test r[9:16] == UInt8[0, 0, 0, 0, 0, 0, 0x04, 0x00]
+        @test r[17:20] == UInt8[0, 0, 0x10, 0x00]
+        @test Wire.get_u32(r, 21) == 8
+        @test r[25] == 0x03
+        @test all(==(0x00), r[26:32])
+        @test length(r) == 32
+        @test Wire.pathid(ReadRequest(fh, Int64(0), Int32(1); pathid=0x03)) == 0x03
+        # On the control link the request is byte-identical to one that never
+        # heard of data paths.
+        plain = encode(ReadRequest(fh, Int64(1024), Int32(4096)), UInt16(6))
+        @test length(plain) == 24 && Wire.get_u32(plain, 21) == 0
+        @test Wire.pathid(ReadRequest(fh, Int64(0), Int32(1))) == 0x00
+    end
+
+    @testset "kXR_write declares its data but sends it elsewhere" begin
+        data = UInt8[0xde, 0xad, 0xbe, 0xef]
+        w = encode(WriteRequest(fh, Int64(0), data; pathid=0x02), UInt16(6))
+        @test Tuple(w[5:8]) == fh
+        @test w[17] == 0x02                               # path id
+        @test all(==(0x00), w[18:20])                     # reserved
+        # dlen counts the data wherever it travels, but the frame does not
+        # carry it: it goes out on the bound socket instead.
+        @test Wire.get_u32(w, 21) == length(data)
+        @test length(w) == 24
+        @test Wire.path_data(WriteRequest(fh, Int64(0), data; pathid=0x02)) == data
+        @test isempty(Wire.payload(WriteRequest(fh, Int64(0), data; pathid=0x02)))
+
+        # Path 0 keeps the data in the frame, exactly as before.
+        plain = encode(WriteRequest(fh, Int64(0), data), UInt16(6))
+        @test plain[17] == 0x00
+        @test Wire.get_u32(plain, 21) == length(data)
+        @test plain[25:end] == data
+        @test isempty(Wire.path_data(WriteRequest(fh, Int64(0), data)))
+    end
+
+    @testset "a replayed request comes home to the control link" begin
+        # The path id belonged to the session that went away; the reopened one
+        # has bound nothing.
+        r = Wire.without_pathid(ReadRequest(fh, Int64(8), Int32(16); pathid=0x03))
+        @test r.pathid == 0x00 && r.offset == 8 && r.rlen == 16
+        w = Wire.without_pathid(WriteRequest(fh, Int64(8), UInt8[0x01]; pathid=0x03))
+        @test w.pathid == 0x00 && w.data == UInt8[0x01]
+        @test Wire.without_pathid(PingRequest()) isa PingRequest
+    end
 end

@@ -133,7 +133,10 @@ using XRootD.Tools: copyfile
         down = joinpath(dir, "a.txt")
         @test first(copyfile("$host//data/a.txt?authz=tok", down))
         @test read(down, String) == "hello"
-        @test srv.opaque == ["authz=tok"]        # the open, and nothing else
+        # Two requests, both carrying the token: the stat that asks how long
+        # the object should be — the copy's only defence against a transfer
+        # that ends early — and the open that reads it.
+        @test srv.opaque == ["authz=tok", "authz=tok"]
 
         fsc_reset!(srv)
         @test storage_write(storage_for("$host//out/up.bin?authz=tok"), IOBuffer("up")) ==

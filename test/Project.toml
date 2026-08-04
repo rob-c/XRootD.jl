@@ -8,6 +8,7 @@ OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+XRootD = "164e3b87-dc46-4cbc-97a6-5b310108fce0"
 XRootD_jll = "b6113df7-b24e-50c0-846f-35a2e36cb9d5"
 
 [compat]

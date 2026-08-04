@@ -139,7 +139,7 @@ const FS_SEED = [
             "root://127.0.0.1:$port//open/keep.dat",
             OpenFlags.Update | OpenFlags.New,
         )
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
 
         # kXR_delete truncates on open.
         f = fs_file(port, "/open/keep.dat", OpenFlags.Update | OpenFlags.Delete)
@@ -176,7 +176,7 @@ const FS_SEED = [
         @test isOK(st) && srv.nodes["/mk"].dir
 
         st, _ = mkdir(fs, "/mk")                         # already there
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
 
         st, _ = mkdir(fs, "/mk/a/b")                     # missing intermediate
         @test isError(st) && st.code == FSC_NotFound
@@ -208,7 +208,7 @@ const FS_SEED = [
         @test isError(st) && st.code == FSC_NotFound
 
         st, _ = mv(fs, "/mv/to", "/mv/to")                # the destination exists
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
         @test isempty(srv.violations)
     end
 
@@ -244,7 +244,7 @@ const FS_SEED = [
         st, _ = rmdir(fs, "/del/sub/f")                  # rmdir on a file
         @test isError(st) && st.code == FSC_NotFile
         st, _ = rmdir(fs, "/del/sub")                    # not empty
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
         @test haskey(srv.nodes, "/del/sub/f")
 
         st, _ = rm(fs, "/del/sub/f")
@@ -338,9 +338,18 @@ const FS_SEED = [
         st, sp = query(fs, QueryCode.Space, "/data")
         @test isOK(st) && sp == "oss.space=1024&oss.free=512"
 
-        st, _ = query(fs, QueryCode.Visa, "/data")
+        st, _ = query(fs, QueryCode.Prepare, "/data")
         @test isError(st) && st.code == FSC_Unsupported
         @test isempty(srv.violations)
+
+        # kXR_Qvisa names an open handle, so the path form reaches the server
+        # as a query about no file at all — which is a protocol breach the
+        # server is entitled to flag.
+        fsc_reset!(srv)
+        st, _ = query(fs, QueryCode.Visa, "/data")
+        @test isError(st) && st.code == FSC_FileNotOpen
+        @test !isempty(srv.violations)
+        fsc_reset!(srv)
     end
 
     @testset "kXR_locate" begin
@@ -380,7 +389,7 @@ const FS_SEED = [
         @test isOK(st) && target == "/data/a.txt"
 
         st, _ = symlink(fs, "/data/a.txt", "/link/soft")    # the link name is taken
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
 
         st, _ = hardlink(fs, "/data/a.txt", "/link/hard")
         @test isOK(st)
@@ -437,7 +446,7 @@ const FS_SEED = [
         @test srv.nodes["/copy/out.txt"].data == Vector{UInt8}("hello")
 
         st, _ = copy(fs, "/data/a.txt", "/copy/out.txt")     # kXR_new refuses
-        @test isError(st) && st.code == FSC_InvalidRequest
+        @test isError(st) && st.code == FSC_ItExists
 
         st, _ = copy(fs, "/data/b.bin", "/copy/out.txt"; force=true)
         @test isOK(st)

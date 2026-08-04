@@ -38,6 +38,15 @@ isOK(st::XRootDStatus) = st.status == 0x0000
 """
 isError(st::XRootDStatus) = !isOK(st)
 
+"""
+    error_name(st::XRootDStatus) -> String
+
+The protocol name of the server error `st` carries (`"kXR_NotFound"`), for
+logs and messages meant to be read. `ErrorCode` is the namespace to compare
+against in code: `st.code == ErrorCode.NotFound`.
+"""
+error_name(st::XRootDStatus) = Wire.error_name(st.code)
+
 function Base.show(io::IO, st::XRootDStatus)
     if isOK(st)
         print(io, "[SUCCESS]")

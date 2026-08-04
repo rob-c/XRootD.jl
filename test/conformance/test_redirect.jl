@@ -159,6 +159,21 @@ using XRootD: Wire
             @test isempty(rdr.violations)
         end
 
+        @testset "\$XRD_REDIRECTLIMIT moves the bound" begin
+            # A federation that is deep rather than circular is configured for,
+            # not patched around, so the same variable the C++ client reads
+            # decides how far this one follows.
+            rdr, rport = start_redirector(; target_port=0)
+            withenv("XRD_REDIRECTLIMIT" => "2") do
+                fs = XrdCl.FileSystem("root://127.0.0.1:$rport")
+                st, _ = stat(fs, "/data/a.txt")
+                @test isError(st)
+                @test occursin("too many redirects", st.message)
+            end
+            @test length(rdr.ops) == 3      # two hops, plus the one that ran out
+            @test isempty(rdr.violations)
+        end
+
         @testset "a redirect to a dead server is reported, not waited out" begin
             rdr, rport = start_redirector(; target_port=dead_port())
             withenv("XRDC_MAX_STALL_MS" => "500") do

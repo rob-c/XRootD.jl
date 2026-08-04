@@ -10,6 +10,7 @@ using XRootD.Tools:
     COPY_HIGH_WATER
 using CRC32c: crc32c
 using HTTP: HTTP
+using Sockets: Sockets
 
 const Xrdcp = XRootD.Tools.Xrdcp
 const Cksum = XRootD.Tools.Cksum
@@ -38,6 +39,56 @@ function capture_main(f)
         rm(outpath; force=true)
         rm(errpath; force=true)
     end
+end
+
+"""
+An HTTP endpoint whose `HEAD` says the object is `head_len` bytes long and
+whose `GET` hands back `body`, whatever length that is. The two are allowed to
+disagree — that disagreement is the whole point — so the response is written
+onto the socket directly rather than through a server that would keep them
+consistent. `head_len === nothing` omits `Content-Length` entirely: the
+endpoint that will not say.
+"""
+function serve_raw_http(sock, head_len::Union{Integer,Nothing}, body::Vector{UInt8})
+    try
+        method = first(split(readline(sock), ' '))
+        while true                                  # drain the request headers
+            isempty(readline(sock)) && break
+        end
+        if method == "HEAD"
+            len = head_len === nothing ? "" : "Content-Length: $head_len\r\n"
+            write(sock, "HTTP/1.1 200 OK\r\n$(len)Connection: close\r\n\r\n")
+        elseif method == "GET"
+            write(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: $(length(body))\r\n" *
+                "Connection: close\r\n\r\n",
+            )
+            write(sock, body)
+        else
+            write(sock, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        end
+        close(sock)
+    catch
+        # client hung up — done
+    end
+    return nothing
+end
+
+"Start a [`serve_raw_http`](@ref) endpoint; returns `(listener, port)`."
+function start_raw_http(head_len::Union{Integer,Nothing}, body::Vector{UInt8})
+    server = Sockets.listen(Sockets.ip"127.0.0.1", 0)
+    _, port = Sockets.getsockname(server)
+    @async while isopen(server)
+        local sock
+        try
+            sock = Sockets.accept(server)
+        catch
+            break
+        end
+        @async serve_raw_http(sock, head_len, body)
+    end
+    return server, Int(port)
 end
 
 @testset "Tools" begin
@@ -151,6 +202,39 @@ end
             # exactly why verify exists.
             ok, _ = copyfile(src, "http://127.0.0.1:$port/v2.bin")
             @test ok
+        finally
+            close(server)
+        end
+    end
+
+    @testset "a copy that ended early is not a copy" begin
+        # The failure this catches is the one a bad network actually produces:
+        # the source stops sending halfway, the destination stores a valid
+        # short object, and both ends agree on its checksum — so `verify`
+        # passes. Only the source's own declared size contradicts it.
+        #
+        # The endpoint is written onto the socket by hand: HTTP.jl's in-process
+        # server recomputes `Content-Length` for a body-less `HEAD`, and that
+        # header is the one thing this test needs the server to decide.
+        full = Vector{UInt8}(codeunits("0123456789"))
+        server, port = start_raw_http(length(full), full[1:4])
+        try
+            dir = mktempdir()
+            dst = joinpath(dir, "short.bin")
+            ok, msg = copyfile("http://127.0.0.1:$port/obj.bin", dst; verify=true)
+            @test !ok
+            @test occursin("short read: 4 of 10 bytes", msg)
+
+            # An endpoint that will not say how big the object is cannot be
+            # held to a size: a copy from one still works.
+            quiet, qport = start_raw_http(nothing, full)
+            try
+                out = joinpath(dir, "quiet.bin")
+                ok, _ = copyfile("http://127.0.0.1:$qport/o.bin", out)
+                @test ok && read(out) == full
+            finally
+                close(quiet)
+            end
         finally
             close(server)
         end

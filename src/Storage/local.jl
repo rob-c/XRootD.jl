@@ -7,6 +7,8 @@ end
 
 LocalBackend(u::StorageURL) = LocalBackend(u.path)
 
+backend_url(b::LocalBackend) = b.path
+
 function storage_stat(b::LocalBackend)
     ispath(b.path) || return :notfound, nothing
     s = stat(b.path)
@@ -28,6 +30,58 @@ function storage_write(b::LocalBackend, source::IO; length=nothing)
     return :ok
 end
 
+"""
+A stream over an open file. The generic handles exist because a remote object
+has no cursor to hold open; a local file does, and going through them would
+reopen the file for every chunk.
+"""
+struct LocalStream <: StreamHandle
+    io::IOStream
+    path::String
+    size::Int64
+end
+
+stream_size(h::LocalStream) = h.size
+stream_seekable(::LocalStream) = true
+
+function stream_read!(h::LocalStream, buf::Vector{UInt8}, offset::Int64, n::Int)
+    position(h.io) == offset || seek(h.io, offset)
+    return readbytes!(h.io, buf, n)
+end
+
+function stream_write(h::LocalStream, data::Vector{UInt8}, n::Int, offset::Int64)
+    position(h.io) == offset || seek(h.io, offset)
+    GC.@preserve data unsafe_write(h.io, pointer(data), UInt(n))
+    return nothing
+end
+
+function stream_close(h::LocalStream)
+    close(h.io)
+    return :ok
+end
+
+function open_read_handle(b::LocalBackend)
+    # A directory opens perfectly well on Linux and then answers every read
+    # with an error from the kernel; the generic handle rules it out from the
+    # stat, and so does this one.
+    isdir(b.path) && throw(StorageError(b.path, "open", "is a directory"))
+    io = try
+        open(b.path, "r")
+    catch err
+        throw(StorageError(b.path, "open", sprint(showerror, err)))
+    end
+    return LocalStream(io, b.path, Int64(filesize(io)))
+end
+
+function open_write_handle(b::LocalBackend, total)
+    io = try
+        open(b.path, "w")
+    catch err
+        throw(StorageError(b.path, "open", sprint(showerror, err)))
+    end
+    return LocalStream(io, b.path, total === nothing ? Int64(-1) : Int64(total))
+end
+
 function storage_list(b::LocalBackend)
     isdir(b.path) || return Tuple{String,StorageInfo}[]
     out = Tuple{String,StorageInfo}[]
@@ -39,7 +93,11 @@ function storage_list(b::LocalBackend)
 end
 
 function storage_remove(b::LocalBackend)
-    rm(b.path; force=true)
+    try
+        rm(b.path; force=true)
+    catch
+        return :error
+    end
     return :ok
 end
 

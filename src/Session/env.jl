@@ -1,0 +1,145 @@
+# The environment the C++ client reads. A process already configured for
+# XrdCl — a grid job, a site login script, a container image built for the
+# reference client — should not need a second configuration for this one, so
+# the `XRD_*` variables are honoured under their own names and with their own
+# meanings. Where this client has a knob of its own (`XRDC_*`, inherited from
+# libxrdc) that one wins: it is the more specific of the two, and a user who
+# set it meant this client.
+
+"The vocabulary of an environment switch that is on. Anything else is off."
+const ENV_TRUE = ("1", "true", "yes", "on")
+
+"""
+    env_flag(name, default=false) -> Bool
+
+Read a boolean setting. Unset or empty leaves `default` standing; anything
+else is compared against [`ENV_TRUE`](@ref), so `XRD_REQUIRETLS=0` turns a
+setting off as clearly as leaving it out.
+"""
+function env_flag(name::AbstractString, default::Bool=false)
+    v = strip(get(ENV, name, ""))
+    isempty(v) && return default
+    return lowercase(v) in ENV_TRUE
+end
+
+"""
+    env_number(name, default) -> Float64
+
+Read a non-negative numeric setting. A value that does not parse, or that is
+negative, leaves `default` standing: a typo in a site profile should not fail
+every connection the job makes, and a client that silently uses the default is
+the same client an unset variable would have produced.
+"""
+function env_number(name::AbstractString, default::Real)
+    v = strip(get(ENV, name, ""))
+    isempty(v) && return Float64(default)
+    n = tryparse(Float64, v)
+    return (n === nothing || n < 0) ? Float64(default) : n
+end
+
+"[`env_number`](@ref) for a count rather than a duration."
+function env_int(name::AbstractString, default::Integer)
+    v = strip(get(ENV, name, ""))
+    isempty(v) && return Int(default)
+    n = tryparse(Int, v)
+    return (n === nothing || n < 0) ? Int(default) : n
+end
+
+"""
+    xrd_username() -> String
+
+The account asserted at `kXR_login`: `\$XRD_USERNAME`, else `\$USER`, else
+`\$LOGNAME`, else `"nobody"`. Never empty — a container with no passwd entry
+still has to log in as somebody, and an empty name is not a login the server
+will accept.
+"""
+function xrd_username()
+    for var in ("XRD_USERNAME", "USER", "LOGNAME")
+        v = strip(get(ENV, var, ""))
+        isempty(v) || return String(v)
+    end
+    return "nobody"
+end
+
+"""
+    env_cafile() -> Union{String,Nothing}
+
+The CA bundle named by `\$X509_CERT_FILE`, else `\$SSL_CERT_FILE`. This is the
+*bundle*; `\$X509_CERT_DIR` names the hashed directory and is picked up
+separately by [`x509_ca_path`](@ref). A path that does not exist is ignored rather
+than passed to OpenSSL, which would fail the handshake over a stale profile.
+"""
+function env_cafile()
+    for var in ("X509_CERT_FILE", "SSL_CERT_FILE")
+        p = strip(get(ENV, var, ""))
+        (isempty(p) || !isfile(p)) && continue
+        return String(p)
+    end
+    return nothing
+end
+
+"""
+How long a TCP connection may take, in seconds (`\$XRD_CONNECTIONWINDOW`).
+XrdCl's default is 120; this client's is 30, because a connection that has not
+been accepted in 30 seconds is a host that is down far more often than a host
+that is slow, and the caller can raise it. Zero waits as long as the operating
+system does.
+"""
+const DEFAULT_CONNECTION_WINDOW_S = 30
+
+connection_window_s() = env_number("XRD_CONNECTIONWINDOW", DEFAULT_CONNECTION_WINDOW_S)
+
+"""
+Seconds a session may sit idle before a `kXR_ping` keeps it alive
+(`\$XRD_STREAMTIMEOUT`). Zero — the default — means no keepalive at all,
+which is what a short-lived client wants; a long-lived handle over a firewall
+that drops idle NAT entries wants it set.
+"""
+stream_timeout_s() = env_number("XRD_STREAMTIMEOUT", 0)
+
+"""
+Seconds a socket may sit idle before the kernel starts probing the peer
+(`\$XRDC_TCP_KEEPALIVE_S`, `0` leaves the socket at the system default).
+
+This is the layer below [`stream_timeout_s`](@ref), and it answers a failure
+the protocol keepalive cannot: a connection whose path has gone — an expired
+NAT entry, a firewall rule changed under a long transfer, a route withdrawn —
+is not closed, it is *silent*. Nothing arrives, nothing errors, and a read
+waits forever. Kernel probes turn that silence into an error the reader Task
+can act on.
+"""
+const DEFAULT_TCP_KEEPALIVE_S = 60
+
+tcp_keepalive_s() = env_number("XRDC_TCP_KEEPALIVE_S", DEFAULT_TCP_KEEPALIVE_S)
+
+"""
+How many `kXR_redirect` hops to follow before giving up
+(`\$XRD_REDIRECTLIMIT`). The limit is what tells a federation that is sending
+a client round in a circle from one that is merely deep.
+"""
+const DEFAULT_REDIRECT_LIMIT = 8
+
+redirect_limit() = env_int("XRD_REDIRECTLIMIT", DEFAULT_REDIRECT_LIMIT)
+
+"""
+Authentication mechanisms in the order they are tried, best first. `ztn`
+(bearer token) before `sss` (shared secret) before `unix` (an assertion the
+server may or may not believe).
+"""
+const DEFAULT_AUTH_ORDER = ("ztn", "sss", "unix")
+
+"""
+    auth_order() -> Vector{String}
+
+The mechanisms to try, best first. `\$XrdSecPROTOCOL` — XrdCl's own variable,
+comma- or space-separated — both orders and restricts them: a mechanism it
+leaves out is not tried at all, which is how a site pins a job to tokens even
+though the server would have accepted an anonymous `unix` login. Names it
+lists that this client does not implement are kept, ignored on the way past,
+and reported if nothing else works.
+"""
+function auth_order()
+    v = get(ENV, "XrdSecPROTOCOL", "")
+    names = [lowercase(strip(s)) for s in split(v, r"[,\s]+") if !isempty(strip(s))]
+    return isempty(names) ? collect(String, DEFAULT_AUTH_ORDER) : names
+end

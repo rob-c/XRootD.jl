@@ -10,6 +10,7 @@
 # sec/sec_{token,sss,unix}.c and PyXRootD's XrdSecProtocol selection.
 
 using XRootD: Wire, Session
+using XRootD.Session: CredentialRequest
 
 @testset "conformance: the security exchange" begin
     @testset "a login the server does not challenge needs no credential" begin
@@ -145,6 +146,152 @@ using XRootD: Wire, Session
         close(conn)
     end
 
+    @testset "a token the client cannot find is asked for" begin
+        # Falling through to unix is not free: an authorizing server accepts
+        # the login and then refuses operation after operation. Asking here is
+        # the last moment at which the user can still fix it.
+        srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+        asked = CredentialRequest[]
+        conn, err = without_token() do
+            auth_bringup(
+                port;
+                username="tester",
+                prompter=r -> (push!(asked, r); "typed.at.the.prompt"),
+            )
+        end
+        @test err === nothing
+        @test srv.creds[1][1] == "ztn"
+        @test String(srv.creds[1][2]) == "ztn\0typed.at.the.prompt"
+        @test length(asked) == 1
+        @test asked[1].kind === :token
+        @test asked[1].host == "127.0.0.1" && asked[1].port == port
+        @test !asked[1].secret
+        # The prompt names the endpoint that asked and every place already
+        # searched, so the answer can be made permanent.
+        @test occursin("root://127.0.0.1:$port", asked[1].reason)
+        @test "\$BEARER_TOKEN" in asked[1].searched
+        @test isempty(srv.violations)
+        close(conn)
+    end
+
+    @testset "a declined prompt falls through as though nothing was asked" begin
+        srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+        conn, err = without_token() do
+            auth_bringup(port; username="tester", prompter=_ -> nothing)
+        end
+        @test err === nothing
+        @test srv.creds[1][1] == "unix"
+        @test isempty(srv.violations)
+        close(conn)
+    end
+
+    @testset "a credential the client already has is not asked about" begin
+        # Three ways of already having one: the caller passed a token, the
+        # environment holds one, or sss can be satisfied instead. None of them
+        # is a reason to interrupt the user.
+        asked = CredentialRequest[]
+        record = r -> (push!(asked, r); nothing)
+
+        srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+        conn, err = without_token() do
+            auth_bringup(port; username="tester", token="from.the.caller", prompter=record)
+        end
+        @test err === nothing && isempty(asked)
+        @test String(srv.creds[1][2]) == "ztn\0from.the.caller"
+        close(conn)
+
+        srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+        conn, err = withenv("BEARER_TOKEN" => "from.the.environment") do
+            auth_bringup(port; username="tester", prompter=record)
+        end
+        @test err === nothing && isempty(asked)
+        @test String(srv.creds[1][2]) == "ztn\0from.the.environment"
+        close(conn)
+
+        with_keytab(; id=7) do keytab
+            srv, port = start_auth_server(; sec="&P=ztn&P=sss&P=unix")
+            conn, err = without_token() do
+                auth_bringup(port; username="tester", keytab=keytab, prompter=record)
+            end
+            @test err === nothing && isempty(asked)
+            @test srv.creds[1][1] == "sss"
+            close(conn)
+        end
+    end
+
+    @testset "a keytab is asked for only when nothing else would work" begin
+        # sss alongside unix needs no help; sss alone is the whole offer, so a
+        # missing keytab ends the session unless someone supplies one.
+        asked = CredentialRequest[]
+        srv, port = start_auth_server(; sec="&P=sss&P=unix")
+        conn, err = without_token() do
+            auth_bringup(port; username="tester", prompter=r -> (push!(asked, r); nothing))
+        end
+        @test err === nothing && isempty(asked)
+        @test srv.creds[1][1] == "unix"
+        close(conn)
+
+        with_keytab(; id=11) do keytab
+            srv, port = start_auth_server(; sec="&P=sss")
+            conn, err = without_token() do
+                auth_bringup(
+                    port; username="tester", prompter=r -> (push!(asked, r); keytab)
+                )
+            end
+            @test err === nothing
+            @test length(asked) == 1 && asked[1].kind === :keytab
+            @test srv.creds[1][1] == "sss"
+            @test Wire.get_u64(srv.creds[1][2], 9) == 11
+            @test isempty(srv.violations)
+            close(conn)
+        end
+    end
+
+    @testset "a token that was typed and refused is not remembered" begin
+        # An accepted token is typed once and reused for every connection the
+        # cluster needs; a refused one is worth asking about again, because a
+        # paste from a stale terminal is exactly what it looks like.
+        function connect_twice(sec, auth_status)
+            srv, port = start_auth_server(; sec=sec, auth_status=auth_status)
+            asked, conns = 0, Any[]
+            previous = Session.prompt_credentials!(_ -> (asked += 1; "typed.token"))
+            Session.forget_credentials!()
+            try
+                without_token() do
+                    for _ in 1:2
+                        try
+                            push!(
+                                conns,
+                                Session.connect(
+                                    "127.0.0.1", port; x509=false, username="tester"
+                                ),
+                            )
+                        catch
+                            # a refused credential fails the bring-up, as it must
+                        end
+                    end
+                end
+            finally
+                Session.prompt_credentials!(previous)
+                Session.forget_credentials!()
+                foreach(close, conns)
+            end
+            return srv, asked, length(conns)
+        end
+
+        srv, asked, up = connect_twice("&P=ztn", Wire.kXR_error)
+        @test asked == 2
+        @test up == 0
+        @test length(srv.creds) == 2
+        @test isempty(srv.violations)
+
+        srv, asked, up = connect_twice("&P=ztn", Wire.kXR_ok)
+        @test asked == 1
+        @test up == 2
+        @test all(String(c[2]) == "ztn\0typed.token" for c in srv.creds)
+        @test isempty(srv.violations)
+    end
+
     @testset "no offered mechanism can be satisfied" begin
         # gsi and krb5 are real protocols this client does not implement.
         # Sending a unix credential anyway would be answering a challenge that
@@ -159,6 +306,97 @@ using XRootD: Wire, Session
         @test occursin("no supported authentication mechanism offered", msg)
         @test occursin("gsi", msg) && occursin("krb5", msg)
         @test isempty(srv.creds)
+        @test isempty(srv.violations)
+    end
+
+    @testset "\$XrdSecPROTOCOL both orders and restricts the choice" begin
+        # XrdCl's variable, honoured under XrdCl's name: a site that pins its
+        # jobs to one mechanism has pinned this client too.
+        @testset "it reorders" begin
+            srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+            conn, err = withenv("BEARER_TOKEN" => "tok", "XrdSecPROTOCOL" => "unix,ztn") do
+                auth_bringup(port; username="tester")
+            end
+            @test err === nothing
+            @test srv.creds[1][1] == "unix"     # ztn was available and passed over
+            @test isempty(srv.violations)
+            close(conn)
+        end
+
+        @testset "it restricts" begin
+            # unix is offered and would have worked. Pinned to ztn with no
+            # token to send, the session ends rather than logging in weakly —
+            # which is the whole point of pinning.
+            asked = CredentialRequest[]
+            srv, port = start_auth_server(; sec="&P=sss&P=unix")
+            conn, err = without_token() do
+                withenv("XrdSecPROTOCOL" => "ztn") do
+                    auth_bringup(
+                        port; username="tester", prompter=r -> (push!(asked, r); nothing)
+                    )
+                end
+            end
+            @test conn === nothing && err !== nothing
+            @test isempty(srv.creds)
+            # Nor was a keytab asked for: a credential the client would not
+            # send is not a credential worth interrupting the user about.
+            @test isempty(asked)
+            @test isempty(srv.violations)
+        end
+
+        @testset "the failure names both lists" begin
+            # "the server offered nothing usable" and "the environment
+            # excluded the one mechanism both sides had" look identical from
+            # the outside, so the message distinguishes them.
+            srv, port = start_auth_server(; sec="&P=unix")
+            conn, err = without_token() do
+                withenv("XrdSecPROTOCOL" => "ztn sss") do
+                    auth_bringup(port; username="tester")
+                end
+            end
+            @test conn === nothing
+            msg = sprint(showerror, err)
+            @test occursin("server: unix", msg)
+            @test occursin("client: ztn, sss", msg)
+            @test isempty(srv.violations)
+        end
+
+        @testset "a name this client does not implement is passed over" begin
+            # gsi stays in the list — it is reported when nothing works — but
+            # sss behind it is still tried.
+            with_keytab(; id=5) do keytab
+                srv, port = start_auth_server(; sec="&P=gsi&P=sss&P=unix")
+                conn, err = without_token() do
+                    withenv("XrdSecPROTOCOL" => "gsi,sss,unix") do
+                        auth_bringup(port; username="tester", keytab=keytab)
+                    end
+                end
+                @test err === nothing
+                @test srv.creds[1][1] == "sss"
+                @test isempty(srv.violations)
+                close(conn)
+            end
+        end
+    end
+
+    @testset "a live connection prints no session key" begin
+        # sss leaves a shared signing key on the Connection, and a key that
+        # has been printed into a log is a key that has to be rotated.
+        key = collect(0x01:0x20)
+        srv, port = start_auth_server(; sec="&P=unix", signing_key=key)
+        conn, err = auth_bringup(port; username="tester")
+        @test err === nothing
+        conn.sec_level = 2
+        conn.signing_key = key
+
+        s = sprint(show, conn)
+        @test occursin("tester@127.0.0.1:$port", s)
+        @test occursin("open", s)
+        @test occursin("signed(level 2)", s)
+        @test !occursin("signing_key", s)
+        @test !occursin(string(key), s)
+        close(conn)
+        @test occursin("closed", sprint(show, conn))
         @test isempty(srv.violations)
     end
 

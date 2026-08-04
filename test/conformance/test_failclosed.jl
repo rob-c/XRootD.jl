@@ -35,9 +35,19 @@ end
         conf_reset!(srv)
         f = conf_file(port, OpenFlags.Read)
         srv.huge_dlen = true
-        st, _ = read(f, 16, 0)
+        # One retry, taken immediately: this server lies every time, so the
+        # point here is that recovery is attempted and bounded, not how long
+        # the client is willing to keep at it.
+        st, _ = withenv("XRDC_MAX_RETRIES" => "1", "XRDC_RETRY_BASE_MS" => "1") do
+            read(f, 16, 0)
+        end
         @test isError(st)
         @test occursin("lost", st.message)             # reader refused, link torn down
+        # A read-only handle reopens and replays after a lost connection; the
+        # second login proves it tried, and the still-lying server proves
+        # recovery cannot turn a broken server into a successful read.
+        @test length(srv.logins) == 2
+        srv.huge_dlen = false
         close(f)
     end
 
@@ -95,7 +105,20 @@ end
         c = withenv("XRDC_STALL_DEADLINE_MS" => "not-a-number") do
             return Session.connect("127.0.0.1", port)
         end
-        @test c.stall_deadline_ms == Session.DEFAULT_STALL_DEADLINE_MS
+        @test c.stall_deadline_ms == Session.stall_deadline_default_ms()
+        close(c)
+        # Unset is a deadline, not the absence of one: the default is the
+        # request timeout, so a peer that goes quiet always loses eventually.
+        c = withenv("XRDC_STALL_DEADLINE_MS" => nothing, "XRD_REQUESTTIMEOUT" => "60") do
+            return Session.connect("127.0.0.1", port)
+        end
+        @test c.stall_deadline_ms == 60_000
+        close(c)
+        # An explicit zero is still how a caller turns it off.
+        c = withenv("XRDC_STALL_DEADLINE_MS" => "0") do
+            return Session.connect("127.0.0.1", port)
+        end
+        @test c.stall_deadline_ms == 0
         close(c)
     end
 

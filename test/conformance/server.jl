@@ -39,7 +39,7 @@ Base.@kwdef mutable struct ConfServer
     async_read::Bool = false    # deliver the next read via kXR_attn/kXR_asynresp
     unsolicited::Bool = false   # precede the next reply with a frame for no one
     over_answer::Int = 0        # >0: return this many bytes MORE than requested
-    huge_dlen::Bool = false     # claim a body past Wire.DLEN_MAX, then hang up
+    huge_dlen::Bool = false     # claim a body past Wire.DLEN_MAX, then hang up (sticky)
     stall::Bool = false         # accept the request and never answer
     read_limit::Int = 0         # >0: never serve bytes at or past this file offset
     corrupt_page::Bool = false  # flip a CRC bit in the next pgread reply
@@ -50,7 +50,15 @@ Base.@kwdef mutable struct ConfServer
     fail_write::Bool = false
     fail_sync::Bool = false
     fail_close::Bool = false
+    # kXR_bind data paths
+    paths::Dict{UInt8,IO} = Dict{UInt8,IO}()    # bound path id → its socket
+    next_pathid::UInt8 = 0x01
+    refuse_bind::Bool = false   # answer the next kXR_bind with an error
+    bind_zero::Bool = false     # hand out path id 0, the control link's own
 end
+
+"The 16-byte session id this server hands out at login and demands at bind."
+const CONF_SESSID = UInt8.(1:16)
 
 "Record a protocol breach; the tests fail on a non-empty violation list."
 flag!(srv::ConfServer, msg::AbstractString) = push!(srv.violations, String(msg))
@@ -76,6 +84,8 @@ function conf_reset!(srv::ConfServer)
     srv.fail_write = false
     srv.fail_sync = false
     srv.fail_close = false
+    srv.refuse_bind = false
+    srv.bind_zero = false
     return srv
 end
 
@@ -145,6 +155,43 @@ function cs_take(sock)
     return frame, payload
 end
 
+"""
+Read one request, taking a path-routed `kXR_write`'s data off the bound
+socket instead of the control link. `dlen` counts those bytes wherever they
+travel, which is the rule this parses strictly: a client that also put them
+in the frame would leave `dlen` bytes of data to be read as the next request
+header.
+"""
+function cs_take_routed(srv::ConfServer, sock)
+    frame = read(sock, 24)
+    length(frame) == 24 || throw(EOFError())
+    dlen = Int(Wire.get_u32(frame, 21))
+    src = sock
+    if Wire.get_u16(frame, 3) == Wire.kXR_write && frame[17] != 0x00
+        src = get(srv.paths, frame[17], nothing)
+        if src === nothing
+            flag!(srv, "kXR_write: names unbound path id $(frame[17])")
+            src = sock
+        end
+    end
+    payload = dlen > 0 ? read(src, dlen) : UInt8[]
+    length(payload) == dlen || throw(EOFError())
+    return frame, payload
+end
+
+"""
+The socket a reply for `pathid` goes out on: the bound data path, or the
+control link for path 0. A `kXR_read` answered on the wrong link would still
+reach the client — both are its sockets — so the tests assert the reply
+arrives where it was asked for by having the server refuse to guess.
+"""
+function cs_reply_sock(srv::ConfServer, sock, pathid::UInt8)
+    pathid == 0x00 && return sock
+    out = get(srv.paths, pathid, nothing)
+    out === nothing && flag!(srv, "reply: unbound path id $pathid")
+    return out === nothing ? sock : out
+end
+
 "Check the fhandle a request carries; `at` is its byte offset in the frame."
 function check_fhandle(srv::ConfServer, frame, what; at::Int=5)
     fh = (frame[at], frame[at + 1], frame[at + 2], frame[at + 3])
@@ -167,8 +214,13 @@ conformance server with `violations` and `logins` lists — this file's, the
 namespace server's and the redirector's alike, which bring a connection up
 identically. The username every connection logs in as is recorded, so a test
 can assert which identity was presented and to whom.
+
+`bind_ok` also accepts a connection that ends its bring-up with `kXR_bind`
+instead of `kXR_login` — an extra data path for a session that already
+exists. Returns the path id assigned, or `0x00` for an ordinary login, so
+the caller knows which kind of connection it is now serving.
 """
-function serve_bringup(srv, sock)
+function serve_bringup(srv, sock; bind_ok::Bool=false)
     hello = read(sock, 20)
     length(hello) == 20 || throw(EOFError())
     hello[1:12] == zeros(UInt8, 12) || flag!(srv, "handshake: leading words not zero")
@@ -182,24 +234,76 @@ function serve_bringup(srv, sock)
         sock, vcat(cs_hdr(Wire.get_u16(pf, 1), Wire.kXR_ok, 8), cs_be32(0x520), cs_be32(1))
     )
     lf, _ = cs_take(sock)
-    Wire.get_u16(lf, 3) == Wire.kXR_login || flag!(srv, "bring-up: expected kXR_login")
+    rid = Wire.get_u16(lf, 3)
+    if bind_ok && rid == Wire.kXR_bind
+        return serve_bind(srv, sock, Wire.get_u16(lf, 1), lf)
+    end
+    rid == Wire.kXR_login || flag!(srv, "bring-up: expected kXR_login")
     # The username sits in the 8-byte NUL-padded header field, not the body.
     push!(srv.logins, String(rstrip(String(copy(lf[9:16])), '\0')))
-    write(sock, vcat(cs_hdr(Wire.get_u16(lf, 1), Wire.kXR_ok, 16), UInt8.(1:16)))
-    return nothing
+    write(sock, vcat(cs_hdr(Wire.get_u16(lf, 1), Wire.kXR_ok, 16), CONF_SESSID))
+    return 0x00
 end
 
-function serve_read(srv::ConfServer, sock, sid, frame)
+"""
+`kXR_bind`: the request carries the 16-byte session id the login reply gave
+out, and the answer is a one-byte path id. A bind that names an id this
+server never issued is a breach — the whole point of the field is that a
+second socket cannot join a session it cannot prove it belongs to.
+"""
+function serve_bind(srv::ConfServer, sock, sid::UInt16, frame)
+    push!(srv.ops, Wire.kXR_bind)
+    frame[5:20] == CONF_SESSID || flag!(srv, "kXR_bind: wrong session id")
+    all(==(0x00), frame[21:24]) || flag!(srv, "kXR_bind: dlen is not zero")
+    if srv.refuse_bind
+        cs_error(sock, sid, 3000, "no data paths available")
+        throw(EOFError())
+    end
+    pathid = srv.bind_zero ? 0x00 : srv.next_pathid
+    write(sock, vcat(cs_hdr(sid, Wire.kXR_ok, 1), pathid))
+    # Path id 0 is the control link's own: a client that accepts it would
+    # route this connection's data back onto the other one, so nothing more
+    # can arrive here either way.
+    pathid == 0x00 && throw(EOFError())
+    srv.next_pathid += 0x01
+    srv.paths[pathid] = sock
+    return pathid
+end
+
+"""
+`kXR_read`, including the optional-arguments form: a `dlen` of 8 or more
+carries the path id in its first byte and seven reserved bytes behind it,
+with any pre-read hints after that. The data-bearing reply then goes out on
+that path, while the control link stays free.
+"""
+function serve_read(srv::ConfServer, sock, sid, frame, payload=UInt8[])
     check_fhandle(srv, frame, "kXR_read")
     offset, rlen = cs_i64(frame, 9), cs_i32(frame, 17)
     offset < 0 && flag!(srv, "kXR_read: negative offset $offset")
     rlen < 0 && flag!(srv, "kXR_read: negative rlen $rlen")
+    pathid = 0x00
+    if !isempty(payload)
+        if length(payload) < 8
+            flag!(srv, "kXR_read: alen $(length(payload)) is under the 8-byte minimum")
+        else
+            (length(payload) - 8) % 16 == 0 ||
+                flag!(srv, "kXR_read: pre-read hints are not 16 bytes each")
+            all(==(0x00), payload[2:8]) ||
+                flag!(srv, "kXR_read: reserved bytes of the optional args are not zero")
+            pathid = payload[1]
+        end
+    end
+    # Only the data-bearing answer moves: a kXR_wait or an error is a control
+    # response, and stock XrdXrootd keeps those on the control link.
+    out = cs_reply_sock(srv, sock, pathid)
     if srv.wait_once
         srv.wait_once = false
         return write(sock, vcat(cs_hdr(sid, Wire.kXR_wait, 4), cs_be32(1)))
     end
     if srv.huge_dlen
-        srv.huge_dlen = false
+        # Left set until the test clears it: a server that lies about dlen does
+        # not correct itself between two reads, and a client that reconnects
+        # after the hang-up must meet the same lie rather than a fixed server.
         write(sock, cs_hdr(sid, Wire.kXR_ok, Wire.DLEN_MAX + 1))
         throw(EOFError())                       # hang up behind the lie
     end
@@ -222,18 +326,21 @@ function serve_read(srv::ConfServer, sock, sid, frame)
         pos = 1
         while pos + srv.read_chunk <= length(data)
             chunk = data[pos:(pos + srv.read_chunk - 1)]
-            write(sock, vcat(cs_hdr(sid, Wire.kXR_oksofar, length(chunk)), chunk))
+            write(out, vcat(cs_hdr(sid, Wire.kXR_oksofar, length(chunk)), chunk))
             pos += srv.read_chunk
         end
-        return cs_ok(sock, sid, data[pos:end])
+        return cs_ok(out, sid, data[pos:end])
     end
-    return cs_ok(sock, sid, data)
+    return cs_ok(out, sid, data)
 end
 
 function serve_write(srv::ConfServer, sock, sid, frame, payload)
     check_fhandle(srv, frame, "kXR_write")
     offset = cs_i64(frame, 9)
     offset < 0 && flag!(srv, "kXR_write: negative offset $offset")
+    # byte 17 is the path id, 18:20 are reserved — the data itself has already
+    # been taken off whichever link byte 17 named (`cs_take_routed`).
+    all(==(0x00), frame[18:20]) || flag!(srv, "kXR_write: reserved bytes are not zero")
     srv.fail_write && return cs_error(sock, sid, 3016, "write failed")
     apply_write!(srv, offset, payload)
     return cs_ok(sock, sid)
@@ -397,9 +504,18 @@ end
 
 function serve_conn(srv::ConfServer, sock)
     try
-        serve_bringup(srv, sock)
+        pathid = serve_bringup(srv, sock; bind_ok=true)
+        if pathid != 0x00
+            # A bound data path carries data, never requests: it must stay
+            # unread here, or the write bytes destined for it would be
+            # consumed as request headers.
+            while isopen(sock)
+                sleep(0.02)
+            end
+            return nothing
+        end
         while isopen(sock)
-            frame, payload = cs_take(sock)
+            frame, payload = cs_take_routed(srv, sock)
             sid, rid = Wire.get_u16(frame, 1), Wire.get_u16(frame, 3)
             sid == 0x0000 && flag!(srv, "$(Wire.request_name(rid)): streamid 0")
             push!(srv.ops, rid)
@@ -413,7 +529,7 @@ function serve_conn(srv::ConfServer, sock)
                 line = "7 $(length(srv.data)) 48 1700000000"
                 cs_ok(sock, sid, Vector{UInt8}(codeunits(line)))
             elseif rid == Wire.kXR_read
-                serve_read(srv, sock, sid, frame)
+                serve_read(srv, sock, sid, frame, payload)
             elseif rid == Wire.kXR_write
                 serve_write(srv, sock, sid, frame, payload)
             elseif rid == Wire.kXR_readv

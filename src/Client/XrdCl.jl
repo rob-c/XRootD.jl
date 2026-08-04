@@ -15,13 +15,23 @@ module XrdCl
 using ..Wire
 using ..Session
 
-export XRootDStatus, isOK, isError
-export FileSystem, ping, locate, query, rmdir, protocol
-export File, sync, readv, writev, pgread, pgwrite
-export getxattr, setxattr, listxattr, removexattr, statvfs, checksum, prepare
+export XRootDStatus, isOK, isError, error_name
+export FileSystem, ping, locate, deep_locate, query, rmdir, protocol
+export statx, query_config, set_property, appid, endsess, evict, gpfile
+export dirlist_stat, dirlist_checksum
+export File, sync, readv, writev, clone, pgread, pgwrite, visa, compression
+export getxattr, setxattr, listxattr, removexattr, xattrs
+export statvfs, checksum, checksum_cancel, prepare
+export checkpoint, checkpoint_begin, checkpoint_commit, checkpoint_rollback
+export checkpoint_query, checkpoint_write, checkpoint_truncate
+export reopen!, recoverable, bind_data_path!
 export symlink, hardlink, readlink
 export isExecutable, isOffline
+export ismanager, isserver, ismeta, isproxy, issupervisor
+export supports_gpfile, allows_anon_gpfile, supports_pgio, supports_posc
+export StatInfo, StatFlags, Location, ProtocolInfo
 export OpenFlags, Access, DirListFlags, QueryCode, MkDirFlags
+export PrepareFlags, LocateFlags, ChkPointCode, ErrorCode
 
 include("status.jl")
 include("enums.jl")

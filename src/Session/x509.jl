@@ -117,12 +117,74 @@ by every grid endpoint.
 function use_x509!(ctx::OpenSSL.SSLContext, creds::X509Credentials)
     check_key_secrecy(creds.key)
     if encrypted_key(creds.key)
-        error(
-            "the X.509 private key $(creds.key) is passphrase-encrypted; " *
-            "XRootD.jl cannot prompt for it — create a proxy " *
-            "(voms-proxy-init / grid-proxy-init) and use that instead",
+        pass = ask_credential(
+            CredentialRequest(
+                :passphrase,
+                "",
+                0;
+                reason="the X.509 private key $(creds.key) is passphrase-encrypted",
+                secret=true,
+            );
+            scope=creds.key,
         )
+        pass === nothing && error(
+            "the X.509 private key $(creds.key) is passphrase-encrypted and no " *
+            "passphrase was given — create a proxy (voms-proxy-init / " *
+            "grid-proxy-init) and use that instead",
+        )
+        return try
+            with_key_passphrase(ctx, pass) do
+                return load_x509!(ctx, creds)
+            end
+        catch
+            # The overwhelmingly likely reason a key that decrypted nowhere
+            # else fails here is the passphrase, so it is forgotten and the
+            # next attempt asks again instead of replaying the wrong one.
+            forget_credential!(:passphrase, creds.key)
+            rethrow()
+        end
     end
+    return load_x509!(ctx, creds)
+end
+
+"""
+Run `f` with `pass` installed as the passphrase OpenSSL's PEM reader will use
+for the next key it loads. The context outlives this call, so the pointer is
+cleared and the buffer wiped on the way out: a dangling `userdata` is a
+use-after-free the next time a key is read into the same context.
+"""
+function with_key_passphrase(f::Function, ctx::OpenSSL.SSLContext, pass::AbstractString)
+    buf = vcat(Vector{UInt8}(codeunits(pass)), 0x00)
+    try
+        GC.@preserve buf begin
+            set_passwd_userdata(ctx, pointer(buf))
+            return f()
+        end
+    finally
+        set_passwd_userdata(ctx, C_NULL)
+        fill!(buf, 0x00)
+    end
+end
+
+"""
+Point OpenSSL's default PEM passphrase callback at `p` (a NUL-terminated
+password, or `C_NULL` for none). With no callback of its own installed, the
+PEM reader falls back to `PEM_def_callback`, which uses this userdata as the
+password — the same route `curl(1)` takes for `--key-passwd`.
+"""
+function set_passwd_userdata(ctx::OpenSSL.SSLContext, p::Ptr)
+    ccall(
+        (:SSL_CTX_set_default_passwd_cb_userdata, libssl),
+        Cvoid,
+        (OpenSSL.SSLContext, Ptr{Cvoid}),
+        ctx,
+        p,
+    )
+    return nothing
+end
+
+"Load the certificate chain and key of `creds` into `ctx`, checking they match."
+function load_x509!(ctx::OpenSSL.SSLContext, creds::X509Credentials)
     if ccall(
         (:SSL_CTX_use_certificate_chain_file, libssl),
         Cint,
@@ -146,6 +208,20 @@ function use_x509!(ctx::OpenSSL.SSLContext, creds::X509Credentials)
         error("X.509 certificate $(creds.cert) and key $(creds.key) do not match")
     end
     return ctx
+end
+
+"""
+True when the PEM at `path` carries a private key as well as a certificate,
+which is how `voms-proxy-init` writes a proxy — and why a proxy needs no
+separate key file.
+"""
+function pem_has_key(path::AbstractString)
+    text = try
+        read(path, String)
+    catch
+        return false
+    end
+    return occursin("PRIVATE KEY-----", text)
 end
 
 "True when the PEM at `path` holds a passphrase-encrypted private key."

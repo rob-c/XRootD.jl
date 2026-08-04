@@ -99,6 +99,19 @@ end
         @test storage_move(w, "root://elsewhere:1094//x") == :unsupported
         @test storage_move(w, "https://elsewhere/x") == :unsupported
 
+        # A destination that is already there is the client's to settle: the
+        # rename is refused outright unless `overwrite` says to clear the way.
+        keep = storage_for("$host//out/keep.bin")
+        @test storage_write(keep, IOBuffer("kept")) == :ok
+        moved = storage_for("$host//out/moved.bin")
+        @test storage_move(moved, "$host//out/keep.bin") == :error
+        @test srv.nodes["/out/keep.bin"].data == Vector{UInt8}("kept")
+        @test srv.nodes["/out/moved.bin"].data == Vector{UInt8}("re")
+        @test storage_move(moved, "$host//out/keep.bin"; overwrite=true) == :ok
+        @test srv.nodes["/out/keep.bin"].data == Vector{UInt8}("re")
+        @test !haskey(srv.nodes, "/out/moved.bin")
+        @test storage_move(keep, "$host//out/moved.bin") == :ok
+
         @test storage_remove(storage_for("$host//out/moved.bin")) == :ok
         @test !haskey(srv.nodes, "/out/moved.bin")
         @test storage_remove(storage_for("$host//out/moved.bin")) == :error
@@ -225,6 +238,76 @@ end
         @test fs_cli(() -> FsXrdfs.main(String[]))[1] == 2
 
         # Nothing above should have left a file open on the server.
+        @test isempty(srv.handles)
+        @test isempty(srv.violations)
+    end
+
+    @testset "the xrdfs commands beyond ls and stat" begin
+        fsc_reset!(srv)
+
+        code, out = fs_cli(() -> FsXrdfs.main([host, "statx", "/data/a.txt", "/data/sub"]))
+        @test code == 0
+        lines = split(strip(out), '\n')
+        @test length(lines) == 2
+        @test occursin("/data/a.txt", lines[1]) && occursin("file", lines[1])
+        @test occursin("/data/sub", lines[2]) && occursin("dir", lines[2])
+
+        code, out = fs_cli(() -> FsXrdfs.main([host, "locate", "/data/a.txt"]))
+        @test code == 0 && occursin("Location", out)
+
+        code, out = fs_cli(() -> FsXrdfs.main([host, "checksum", "/data/a.txt"]))
+        @test code == 0 && strip(out) == "adler32 062c0215"
+        code, out = fs_cli(() -> FsXrdfs.main([host, "checksum", "/data/a.txt", "md5"]))
+        @test code == 0 && startswith(strip(out), "md5 ")
+
+        code, out = fs_cli(() -> FsXrdfs.main([host, "prepare", "/data/a.txt"]))
+        @test code == 0 && startswith(strip(out), "prep-")
+        @test fs_cli(() -> FsXrdfs.main([host, "prepare", "-e", "/data/a.txt"]))[1] == 0
+
+        # -p asks the server to make the whole path, in one request.
+        @test fs_cli(() -> FsXrdfs.main([host, "mkdir", "-p", "/cli/deep/deeper"]))[1] == 0
+        @test srv.nodes["/cli/deep/deeper"].dir
+
+        @test fs_cli(() -> FsXrdfs.main([host, "touch", "/cli/deep/leaf"]))[1] == 0
+        @test haskey(srv.nodes, "/cli/deep/leaf")
+
+        @test fs_cli(() -> FsXrdfs.main([host, "chmod", "/cli/deep", "700"]))[1] == 0
+        @test srv.nodes["/cli/deep"].mode == 0o700
+
+        @test fs_cli(() -> FsXrdfs.main([host, "truncate", "/data/b.bin", "1"]))[1] == 0
+        @test length(srv.nodes["/data/b.bin"].data) == 1
+
+        # xattr addresses one attribute at a time, and lists them all.
+        @test fs_cli(
+            () -> FsXrdfs.main([host, "xattr", "/data/a.txt", "set", "k", "v"])
+        )[1] == 0
+        @test srv.nodes["/data/a.txt"].xattr["k"] == Vector{UInt8}("v")
+        code, out = fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt", "get", "k"]))
+        @test code == 0 && strip(out) == "v"
+        code, out = fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt", "list"]))
+        @test code == 0 && strip(out) == "k"
+        @test fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt", "rm", "k"]))[1] == 0
+        @test isempty(srv.nodes["/data/a.txt"].xattr)
+
+        # rm -r takes the tree; rm without it still refuses a directory.
+        @test fs_cli(() -> FsXrdfs.main([host, "rm", "/cli"]))[1] == 1
+        @test fs_cli(() -> FsXrdfs.main([host, "rm", "-r", "/cli"]))[1] == 0
+        @test !any(startswith(p, "/cli") for p in keys(srv.nodes))
+
+        # A failed operation exits 1; a malformed command line exits 2.
+        @test fs_cli(() -> FsXrdfs.main([host, "checksum", "/data/nope"]))[1] == 1
+        @test fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt", "get", "k"]))[1] == 1
+        @test fs_cli(() -> FsXrdfs.main([host, "locate"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "statx"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "chmod", "/data"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "chmod", "/data", "seven"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "truncate", "/data", "big"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "xattr", "/data/a.txt", "wat"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "rm", "-r"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "mkdir", "-p"]))[1] == 2
+        @test fs_cli(() -> FsXrdfs.main([host, "prepare"]))[1] == 2
+
         @test isempty(srv.handles)
         @test isempty(srv.violations)
     end

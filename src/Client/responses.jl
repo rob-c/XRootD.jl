@@ -77,6 +77,40 @@ function Base.show(io::IO, st::StatInfo)
 end
 
 """
+    StatFlags(flags::Integer)
+
+What a `kXR_statx` reply says about one path: the same flags bitfield
+[`StatInfo`](@ref) carries, without the size, times or ownership — that is
+all `statx` answers, one byte per path, which is what makes it cheap enough
+to ask about a whole directory at once.
+
+Predicates: `isdir`, `isfile`, `isreadable`, `iswritable` (Base overloads),
+[`isExecutable`](@ref), [`isOffline`](@ref) — the same set `StatInfo` has,
+so code that tests one reads the same on the other.
+"""
+struct StatFlags
+    flags::UInt32
+end
+
+StatFlags(flags::Integer) = StatFlags(UInt32(flags))
+
+Base.isdir(f::StatFlags) = (f.flags & Wire.kXR_isDir) != 0
+Base.isfile(f::StatFlags) = (f.flags & (Wire.kXR_isDir | Wire.kXR_other)) == 0
+Base.isreadable(f::StatFlags) = (f.flags & Wire.kXR_readable) != 0
+Base.iswritable(f::StatFlags) = (f.flags & Wire.kXR_writable) != 0
+isExecutable(f::StatFlags) = (f.flags & Wire.kXR_xset) != 0
+isOffline(f::StatFlags) = (f.flags & Wire.kXR_offline) != 0
+
+function Base.show(io::IO, f::StatFlags)
+    kind = isdir(f) ? "dir" : ((f.flags & Wire.kXR_other) != 0 ? "other" : "file")
+    perm = string(isreadable(f) ? 'r' : '-', iswritable(f) ? 'w' : '-')
+    print(io, "StatFlags($kind, $perm")
+    isOffline(f) && print(io, ", offline")
+    print(io, ")")
+    return nothing
+end
+
+"""
     Location(address, node, access)
 
 One replica location from `locate`: `address` is `host:port`, `node` the
@@ -101,10 +135,68 @@ end
 
 Server protocol information: the protocol `version` (e.g. `0x0520` for
 5.2.0) and the server's type/host flags.
+
+Predicates over `hostinfo`: [`ismanager`](@ref) and [`isserver`](@ref) for the
+endpoint's role, [`ismeta`](@ref), [`isproxy`](@ref) and [`issupervisor`](@ref)
+for the attributes that qualify it. `ismanager` is the same question `locate`
+answers about a replica, so it reads the same on either.
 """
 struct ProtocolInfo
     version::UInt32
     hostinfo::UInt32
+end
+
+"""
+`true` when the endpoint redirects to something else rather than holding data
+itself — asked of a `protocol` reply, or of a `locate` answer's [`Location`](@ref).
+"""
+ismanager(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_isManager) != 0
+
+"`true` when the endpoint holds data itself."
+isserver(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_isServer) != 0
+
+"`true` when the manager manages other managers rather than data servers."
+ismeta(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_attrMeta) != 0
+
+"`true` when the endpoint fronts a cluster it is not part of."
+isproxy(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_attrProxy) != 0
+
+"`true` when the manager is itself subordinate to another one."
+issupervisor(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_attrSuper) != 0
+
+"""
+`true` when the server answers `kXR_gpfile` (`kXR_supgpf`). No server this
+package was checked against sets it, which is the fact
+[`XRootD.XrdCl.gpfile`](@ref) is written around.
+"""
+supports_gpfile(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_supgpf) != 0
+
+"""
+`true` when `kXR_gpfile` is open to clients that did not authenticate
+(`kXR_anongpf`). It qualifies [`supports_gpfile`](@ref) rather than
+standing on its own.
+"""
+allows_anon_gpfile(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_anongpf) != 0
+
+"`true` when the server answers `kXR_pgread`/`kXR_pgwrite` (`kXR_suppgrw`)."
+supports_pgio(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_suppgrw) != 0
+
+"""
+`true` when the server honours persist-on-successful-close (`kXR_supposc`),
+the `OpenFlags.POSC` that leaves nothing behind when a transfer is
+interrupted.
+"""
+supports_posc(p::ProtocolInfo) = (p.hostinfo & Wire.kXR_supposc) != 0
+
+function protocol_role(p::ProtocolInfo)
+    role = if ismanager(p)
+        issupervisor(p) ? "supervisor" : (ismeta(p) ? "meta-manager" : "manager")
+    elseif isserver(p)
+        "server"
+    else
+        "unknown"
+    end
+    return isproxy(p) ? "proxy $role" : role
 end
 
 function Base.show(io::IO, p::ProtocolInfo)
@@ -112,6 +204,6 @@ function Base.show(io::IO, p::ProtocolInfo)
     minor = (p.version >> 4) & 0xf
     patch = p.version & 0xf
     print(io, "ProtocolInfo(version=$(Int(p.version)) ($major.$minor.$patch), ")
-    print(io, "hostinfo=0x$(string(p.hostinfo; base=16)))")
+    print(io, "$(protocol_role(p)), hostinfo=0x$(string(p.hostinfo; base=16)))")
     return nothing
 end

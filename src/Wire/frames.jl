@@ -69,6 +69,29 @@ descriptor list while the write data follows on the link.
 trailer(::Request) = UInt8[]
 
 """
+    pathid(req::Request) -> UInt8
+
+The bound data path this request is routed over (default `0`, the control
+link). A non-zero id names a second connection the session established with
+`kXR_bind`; the request header still travels on the control link, but the
+bulk bytes — the data of a `kXR_write`, the reply to a `kXR_read` — use the
+bound one. See [`path_data`](@ref).
+"""
+pathid(::Request) = UInt8(0)
+
+"""
+    path_data(req::Request) -> AbstractVector{UInt8}
+
+Bytes counted in `dlen` but sent on the request's bound data path rather than
+in the frame (default: none). This is the third shape the protocol uses for
+request bytes, and the mirror image of [`trailer`](@ref): a `kXR_write` on
+path *n* declares its length in `dlen` and then writes the data to the bound
+socket, leaving the control link free for the requests that have to interleave
+with a long transfer.
+"""
+path_data(::Request) = UInt8[]
+
+"""
     encode(req::Request, streamid::UInt16) -> Vector{UInt8}
 
 Serialize `req` as a complete wire frame: 24-byte `ClientRequestHdr`
@@ -76,6 +99,10 @@ Serialize `req` as a complete wire frame: 24-byte `ClientRequestHdr`
 [`trailer`](@ref) bytes. `streamid` is owned by the Session layer, which
 stamps each in-flight request with a distinct id and matches responses back
 by it.
+
+`dlen` covers the payload *and* any [`path_data`](@ref), which the Session
+layer writes to the bound socket after this frame — the server sizes its read
+from `dlen` whichever link the bytes arrive on.
 """
 function encode(req::Request, streamid::UInt16)
     pl = payload(req)
@@ -84,7 +111,7 @@ function encode(req::Request, streamid::UInt16)
     set_u16!(frame, 1, streamid)
     set_u16!(frame, 3, requestid(req))
     body!(frame, req)
-    set_u32!(frame, 21, UInt32(length(pl)))
+    set_u32!(frame, 21, UInt32(length(pl) + length(path_data(req))))
     isempty(pl) || set_bytes!(frame, REQUEST_HDRLEN + 1, pl)
     isempty(tr) || set_bytes!(frame, REQUEST_HDRLEN + length(pl) + 1, tr)
     return frame

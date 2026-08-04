@@ -100,7 +100,7 @@ requestid(::PingRequest) = kXR_ping
 """
     StatRequest(path::AbstractString;
                 options::UInt8 = 0x00,
-                fhandle::NTuple{4,UInt8} = (0x00, 0x00, 0x00, 0x00))
+                fhandle::NTuple{4,UInt8} = NULL_FHANDLE)
 
 `kXR_stat` — stat a path (the usual case) or an open file handle (empty
 `path` + real `fhandle`). `options = kXR_vfs` requests virtual-filesystem
@@ -114,9 +114,7 @@ struct StatRequest <: Request
 end
 
 function StatRequest(
-    path::AbstractString;
-    options::UInt8=0x00,
-    fhandle::NTuple{4,UInt8}=(0x00, 0x00, 0x00, 0x00),
+    path::AbstractString; options::UInt8=0x00, fhandle::NTuple{4,UInt8}=NULL_FHANDLE
 )
     return StatRequest(String(path), options, fhandle)
 end
@@ -269,7 +267,7 @@ struct TruncateRequest <: Request
 end
 
 function TruncateRequest(path::AbstractString, size::Integer)
-    return TruncateRequest(String(path), Int64(size), (0x00, 0x00, 0x00, 0x00))
+    return TruncateRequest(String(path), Int64(size), NULL_FHANDLE)
 end
 
 requestid(::TruncateRequest) = kXR_truncate
@@ -307,24 +305,32 @@ end
 payload(r::LocateRequest) = codeunits(r.path)
 
 """
-    QueryRequest(infotype::UInt16, args)
+    QueryRequest(infotype::UInt16, args; fhandle = NULL_FHANDLE)
 
 `kXR_query` — query server information: `kXR_QStats`, `kXR_Qspace`,
 `kXR_Qcksum`, `kXR_Qconfig`, ... `args` is the query argument text.
+
+A few infotypes ask about an open file rather than a path — `kXR_Qvisa` and
+`kXR_Qopaqug` — and name it with `fhandle` instead of in `args`. The handle
+sits at parameter bytes 9:12, past a two-byte hole after the infotype.
 """
 struct QueryRequest <: Request
     infotype::UInt16
     args::String
+    fhandle::NTuple{4,UInt8}
 end
 
-function QueryRequest(infotype::UInt16, args::AbstractString)
-    return QueryRequest(infotype, String(args))
+function QueryRequest(
+    infotype::UInt16, args::AbstractString=""; fhandle::NTuple{4,UInt8}=NULL_FHANDLE
+)
+    return QueryRequest(infotype, String(args), fhandle)
 end
 
 requestid(::QueryRequest) = kXR_query
 
 function body!(frame::Vector{UInt8}, r::QueryRequest)
     set_u16!(frame, 5, r.infotype)
+    set_bytes!(frame, 9, collect(r.fhandle))
     return frame
 end
 
@@ -361,15 +367,29 @@ end
 payload(r::OpenRequest) = codeunits(r.path)
 
 """
-    ReadRequest(fhandle, offset::Int64, rlen::Int32)
+    ReadRequest(fhandle, offset::Int64, rlen::Int32; pathid::UInt8 = 0x00)
 
 `kXR_read` — read `rlen` bytes at `offset` from the open file `fhandle`.
 Response body: the raw bytes (large reads arrive chunked via `kXR_oksofar`).
+
+A non-zero `pathid` asks for the answer on a bound data path
+([`Wire.BindRequest`](@ref)). It travels as the request's *optional
+arguments*: an 8-byte payload of the id and seven reserved bytes, which is
+also where pre-read hints would go — this client sends none, since a hint is
+only useful to a caller that already knows its next read, and such a caller
+can simply issue it.
 """
 struct ReadRequest <: Request
     fhandle::NTuple{4,UInt8}
     offset::Int64
     rlen::Int32
+    pathid::UInt8
+end
+
+function ReadRequest(
+    fhandle::NTuple{4,UInt8}, offset::Int64, rlen::Int32; pathid::Integer=0x00
+)
+    return ReadRequest(fhandle, offset, rlen, UInt8(pathid))
 end
 
 requestid(::ReadRequest) = kXR_read
@@ -381,15 +401,33 @@ function body!(frame::Vector{UInt8}, r::ReadRequest)
     return frame
 end
 
+pathid(r::ReadRequest) = r.pathid
+
+# alen(8) = the id plus seven reserved bytes, and no pre-reads behind it. A
+# read on the control link sends no optional arguments at all, so its bytes on
+# the wire are unchanged.
+payload(r::ReadRequest) = r.pathid == 0x00 ? UInt8[] : vcat(r.pathid, zeros(UInt8, 7))
+
 """
-    WriteRequest(fhandle, offset::Int64, data::Vector{UInt8})
+    WriteRequest(fhandle, offset::Int64, data::Vector{UInt8}; pathid::UInt8 = 0x00)
 
 `kXR_write` — write `data` at `offset` to the open file `fhandle`.
+
+With a non-zero `pathid` the header goes out on the control link and `data`
+on the bound data path ([`path_data`](@ref)); `dlen` still declares the full
+length, so the server reads the same number of bytes either way.
 """
 struct WriteRequest <: Request
     fhandle::NTuple{4,UInt8}
     offset::Int64
     data::Vector{UInt8}
+    pathid::UInt8
+end
+
+function WriteRequest(
+    fhandle::NTuple{4,UInt8}, offset::Int64, data::Vector{UInt8}; pathid::Integer=0x00
+)
+    return WriteRequest(fhandle, offset, data, UInt8(pathid))
 end
 
 requestid(::WriteRequest) = kXR_write
@@ -397,24 +435,38 @@ requestid(::WriteRequest) = kXR_write
 function body!(frame::Vector{UInt8}, r::WriteRequest)
     set_bytes!(frame, 5, collect(r.fhandle))
     set_u64!(frame, 9, reinterpret(UInt64, r.offset))
+    frame[17] = r.pathid
     return frame
 end
 
-payload(r::WriteRequest) = r.data
+pathid(r::WriteRequest) = r.pathid
+payload(r::WriteRequest) = r.pathid == 0x00 ? r.data : UInt8[]
+path_data(r::WriteRequest) = r.pathid == 0x00 ? UInt8[] : r.data
 
 """
-    CloseRequest(fhandle)
+    CloseRequest(fhandle; fsize::Integer = 0)
 
 `kXR_close` — close an open file handle.
+
+A non-zero `fsize` asks the server to verify the length before it accepts
+the file: a close that finds a different size fails AND erases the file,
+which is how a writer says "this transfer was complete or it was nothing".
+Zero, the default, suppresses the check.
 """
 struct CloseRequest <: Request
     fhandle::NTuple{4,UInt8}
+    fsize::Int64
+end
+
+function CloseRequest(fhandle::NTuple{4,UInt8}; fsize::Integer=0)
+    return CloseRequest(fhandle, Int64(fsize))
 end
 
 requestid(::CloseRequest) = kXR_close
 
 function body!(frame::Vector{UInt8}, r::CloseRequest)
     set_bytes!(frame, 5, collect(r.fhandle))
+    set_u64!(frame, 9, reinterpret(UInt64, r.fsize))   # bytes 13:16 reserved
     return frame
 end
 
@@ -562,6 +614,77 @@ end
 
 function trailer(r::WriteVRequest)
     return reduce(vcat, (seg.data for seg in r.segments); init=UInt8[])
+end
+
+# ---- server-side range copy (kXR_clone) ----
+
+"""
+One clone item: `src_len` bytes from `src_offset` of the handle `fhandle`
+names, landing at `dst_offset` in the destination the request names.
+"""
+const CloneItem = @NamedTuple{
+    fhandle::NTuple{4,UInt8}, src_offset::Int64, src_len::Int64, dst_offset::Int64
+}
+
+"""
+    CloneRequest(dst_fhandle, items::Vector{CloneItem})
+
+`kXR_clone` — copy byte ranges between two open handles without the bytes
+passing through the client. The header body is `dst_fhandle[4]` then 12
+reserved bytes; the payload is one 32-byte
+[`CloneItem`](@ref) per range (`src_fhandle[4] + reserved[4] +
+src_offset + src_len + dst_offset`, big-endian). A successful reply is
+`kXR_ok` with an empty body — the server reports no per-item outcome, so
+the operation is all-or-nothing as far as the client can see.
+
+`kXR_clone` is **not** in the `XProtocol.hh` that ships with XRootD, whose
+opcode table ends at `kXR_writev` (3031) with 3032 as `kXR_REQFENCE`. It is
+an nginx-xrootd extension (`src/protocols/root/read/clone.c`) sitting in the
+first slot past the fence; a stock server answers it with `kXR_InvalidRequest`.
+Both handles must be open on the connection that carries the request.
+
+The item count is capped at [`CLONE_MAXITEMS`](@ref), the server's own
+`maxClonesz`; the server skips a zero-length item, and rejects an offset or
+length that would overflow a signed 64-bit file offset.
+"""
+struct CloneRequest <: Request
+    dst_fhandle::NTuple{4,UInt8}
+    items::Vector{CloneItem}
+
+    function CloneRequest(dst_fhandle::NTuple{4,UInt8}, items::Vector{CloneItem})
+        if isempty(items) || length(items) > CLONE_MAXITEMS
+            throw(
+                ArgumentError(
+                    "clone: bad item count $(length(items)) (want 1..$(CLONE_MAXITEMS))"
+                ),
+            )
+        end
+        for it in items
+            if it.src_offset < 0 || it.src_len < 0 || it.dst_offset < 0
+                throw(ArgumentError("clone: negative offset or length in $it"))
+            end
+        end
+        return new(dst_fhandle, items)
+    end
+end
+
+requestid(::CloneRequest) = kXR_clone
+
+function body!(frame::Vector{UInt8}, r::CloneRequest)
+    set_bytes!(frame, 5, collect(r.dst_fhandle))   # bytes 9:20 reserved (zero)
+    return frame
+end
+
+function payload(r::CloneRequest)
+    pl = zeros(UInt8, CLONE_ITEM_LEN * length(r.items))
+    for (i, it) in enumerate(r.items)
+        off = CLONE_ITEM_LEN * (i - 1) + 1
+        set_bytes!(pl, off, collect(it.fhandle))   # bytes 5:8 of the item reserved
+        set_u64!(pl, off + 8, reinterpret(UInt64, it.src_offset))
+        set_u64!(pl, off + 16, reinterpret(UInt64, it.src_len))
+        set_u64!(pl, off + 24, reinterpret(UInt64, it.dst_offset))
+    end
+    return pl
 end
 
 # ---- paged I/O (per-page CRC32c; libxrdc ops_file_pg.c) ----
@@ -716,7 +839,7 @@ function FattrRequest(
     names::Vector{<:AbstractString}=String[],
     values::Vector{<:AbstractVector{UInt8}}=Vector{UInt8}[],
     options::UInt8=0x00,
-    fhandle::NTuple{4,UInt8}=(0x00, 0x00, 0x00, 0x00),
+    fhandle::NTuple{4,UInt8}=NULL_FHANDLE,
 )
     return FattrRequest(
         subcode, String(path), String.(names), Vector{UInt8}.(values), options, fhandle
@@ -892,6 +1015,184 @@ end
 payload(r::PrepareRequest) = codeunits(join(r.paths, "\n"))
 
 """
+    GPFileRequest(path; options::Int32 = Int32(0), buffsz::Int32 = Int32(0))
+
+`kXR_gpfile` — "grouped parallel fetch", the retired bulk get/put.
+`options` and `buffsz` are 32-bit big-endian, separated by 8 reserved bytes,
+and the payload is the path (`ClientGPfileRequest`).
+
+The layout is the one upstream declares, carried verbatim including its own
+verdict on it — the struct in `XProtocol.hh` is preceded by the comment
+`// ??? This is all wrong; correct when implemented`. Nothing here can fix
+that: the fields have no documented meaning, no reference client sends the
+request, and the two capability bits that would advertise it
+([`kXR_supgpf`](@ref), [`kXR_anongpf`](@ref)) are set by no server known to
+this package. A server that receives it answers `kXR_Unsupported`, which is
+what [`XRootD.XrdCl.gpfile`](@ref) reports.
+
+It is encoded here so the opcode is reachable rather than merely named, and
+so a server that ever does implement it can be talked to without a patch;
+[`readv`](@ref ReadVRequest) is what the operation's purpose became.
+"""
+struct GPFileRequest <: Request
+    path::String
+    options::Int32
+    buffsz::Int32
+end
+
+function GPFileRequest(
+    path::AbstractString; options::Integer=Int32(0), buffsz::Integer=Int32(0)
+)
+    return GPFileRequest(String(path), Int32(options), Int32(buffsz))
+end
+
+requestid(::GPFileRequest) = kXR_gpfile
+
+function body!(frame::Vector{UInt8}, r::GPFileRequest)
+    set_u32!(frame, 5, reinterpret(UInt32, r.options))   # bytes 9:16 reserved (zero)
+    set_u32!(frame, 17, reinterpret(UInt32, r.buffsz))
+    return frame
+end
+
+payload(r::GPFileRequest) = codeunits(r.path)
+
+"""
+    StatxRequest(paths)
+
+`kXR_statx` — stat many paths in one exchange. The reply is one flags byte
+per path in the order asked (see [`parse_statx`](@ref)), not a stat line: it
+answers "what is this, and can I get at it" for a whole directory's worth of
+names without a round trip each. Payload is the newline-separated path list.
+"""
+struct StatxRequest <: Request
+    paths::Vector{String}
+end
+
+StatxRequest(paths::Vector{<:AbstractString}) = StatxRequest(String.(paths))
+requestid(::StatxRequest) = kXR_statx
+payload(r::StatxRequest) = codeunits(join(r.paths, "\n"))
+
+"""
+    EndsessRequest(sessid)
+
+`kXR_endsess` — end a session the server is holding. `sessid` is the 16-byte
+id the login reply carried; ending a session releases the server's state for
+it instead of leaving it to time out. An all-zero id ends the current one.
+"""
+struct EndsessRequest <: Request
+    sessid::NTuple{16,UInt8}
+end
+
+EndsessRequest() = EndsessRequest(ntuple(_ -> 0x00, 16))
+EndsessRequest(id::AbstractVector{UInt8}) = EndsessRequest(pad16(id))
+requestid(::EndsessRequest) = kXR_endsess
+body!(frame::Vector{UInt8}, r::EndsessRequest) = set_bytes!(frame, 5, collect(r.sessid))
+
+"""
+    BindRequest(sessid)
+
+`kXR_bind` — attach this connection to an existing session as an extra data
+path. `sessid` is the id the login reply carried on the connection that owns
+the session; the reply's first payload byte is the path id the server
+assigned, which requests then name to route their data over this connection.
+"""
+struct BindRequest <: Request
+    sessid::NTuple{16,UInt8}
+end
+
+BindRequest(id::AbstractVector{UInt8}) = BindRequest(pad16(id))
+requestid(::BindRequest) = kXR_bind
+body!(frame::Vector{UInt8}, r::BindRequest) = set_bytes!(frame, 5, collect(r.sessid))
+
+"Right-pad (or truncate) `id` to the 16 bytes a session id occupies on the wire."
+function pad16(id::AbstractVector{UInt8})
+    length(id) > SESSION_ID_LEN &&
+        throw(ArgumentError("session id is $(length(id)) bytes, over $(SESSION_ID_LEN)"))
+    return ntuple(i -> i <= length(id) ? id[i] : 0x00, SESSION_ID_LEN)
+end
+
+"""
+    SetRequest(data)
+
+`kXR_set` — set a server-side property of this client. The payload is the
+directive text; the one every client sends is `"appid <name>"`, which labels
+the connection in the server's monitoring stream so an operator can tell
+whose traffic it is.
+"""
+struct SetRequest <: Request
+    data::String
+end
+
+SetRequest(data::AbstractString) = SetRequest(String(data))
+requestid(::SetRequest) = kXR_set
+payload(r::SetRequest) = codeunits(r.data)
+
+"""
+    ChkPointRequest(fhandle, subcode)
+
+`kXR_chkpoint` — transactional writes on an open handle. `kXR_ckpBegin`
+opens a checkpoint, `kXR_ckpCommit` makes the writes made under it
+permanent, `kXR_ckpRollback` undoes them, and `kXR_ckpQuery` asks how much a
+checkpoint on this file may hold ([`parse_checkpoint`](@ref)). `kXR_ckpXeq`
+carries a whole request to be run inside the checkpoint; build that form
+with [`checkpoint_exec`](@ref).
+
+The subcode goes in the LAST byte of the parameter area, not the first —
+bytes 5:8 are the file handle and 9:19 are reserved (libxrdc `ops_file.c`).
+"""
+struct ChkPointRequest <: Request
+    fhandle::NTuple{4,UInt8}
+    subcode::UInt8
+    data::Vector{UInt8}
+    trail::Vector{UInt8}
+end
+
+function ChkPointRequest(fhandle::NTuple{4,UInt8}, subcode::UInt8)
+    return ChkPointRequest(fhandle, subcode, UInt8[], UInt8[])
+end
+
+requestid(::ChkPointRequest) = kXR_chkpoint
+
+function body!(frame::Vector{UInt8}, r::ChkPointRequest)
+    set_bytes!(frame, 5, collect(r.fhandle))
+    frame[20] = r.subcode                      # bytes 9:19 reserved (zero)
+    return frame
+end
+
+payload(r::ChkPointRequest) = r.data
+trailer(r::ChkPointRequest) = r.trail
+
+"""
+    checkpoint_exec(fhandle, inner::Request) -> ChkPointRequest
+
+A `kXR_chkpoint`/`kXR_ckpXeq` that runs `inner` inside the open checkpoint.
+`inner` must be a `kXR_write`, `kXR_pgwrite` or `kXR_truncate` against the
+same handle — those are the three the server knows how to undo.
+
+The embedded request is split the way the wire wants it, on the same rule as
+[`WriteVRequest`](@ref): `dlen` counts only its 24-byte header, and its own
+data streams after the frame. A server that read `dlen` bytes and stopped
+would otherwise take the first data byte for the start of the next request.
+The embedded header carries no stream id of its own — the answer comes back
+on the outer frame's.
+"""
+function checkpoint_exec(fhandle::NTuple{4,UInt8}, inner::Request)
+    rid = requestid(inner)
+    if !(rid in (kXR_write, kXR_pgwrite, kXR_truncate))
+        throw(
+            ArgumentError(
+                "a checkpoint can only execute a write or a truncate, not " *
+                request_name(rid),
+            ),
+        )
+    end
+    frame = encode(inner, UInt16(0))
+    return ChkPointRequest(
+        fhandle, kXR_ckpXeq, frame[1:REQUEST_HDRLEN], frame[(REQUEST_HDRLEN + 1):end]
+    )
+end
+
+"""
     merge_cgi(path, cgi) -> String
 
 Attach opaque `cgi` to `path`, picking the separator the path needs: `?`
@@ -920,6 +1221,7 @@ for T in (
     ChmodRequest,
     DirlistRequest,
     FattrRequest,
+    GPFileRequest,
     LocateRequest,
     MkdirRequest,
     OpenRequest,
@@ -933,3 +1235,47 @@ for T in (
     args = [f === :path ? :(merge_cgi(r.path, cgi)) : :(r.$f) for f in fieldnames(T)]
     @eval with_cgi(r::$T, cgi::AbstractString) = isempty(cgi) ? r : $T($(args...))
 end
+
+"""
+    with_fhandle(r::Request, fhandle) -> Request
+
+Return `r` addressed to `fhandle` instead of the one it carries. A handle is
+valid only on the connection it was opened on, so a request that has to be
+replayed after a reopen has to be re-aimed at the handle the new open gave
+back.
+
+Requests that name no handle are returned unchanged. `kXR_readv` is one of
+them despite carrying handles: its segments may name several files, and
+which of them the reopen replaced is not something the request knows — the
+caller rebuilds it.
+"""
+with_fhandle(r::Request, ::NTuple{4,UInt8}) = r
+
+for T in (
+    ChkPointRequest,
+    CloseRequest,
+    FattrRequest,
+    PgReadRequest,
+    PgWriteRequest,
+    QueryRequest,
+    ReadRequest,
+    StatRequest,
+    SyncRequest,
+    TruncateRequest,
+    WriteRequest,
+)
+    args = [f === :fhandle ? :(fhandle) : :(r.$f) for f in fieldnames(T)]
+    @eval with_fhandle(r::$T, fhandle::NTuple{4,UInt8}) = $T($(args...))
+end
+
+"""
+    without_pathid(r::Request) -> Request
+
+Return `r` routed over the control link. A path id names a socket bound to
+one session; a request replayed after a reopen is going to a session that
+never bound it, so it has to come home to the link that is certain to be
+there. Requests that name no path are returned unchanged.
+"""
+without_pathid(r::Request) = r
+without_pathid(r::ReadRequest) = ReadRequest(r.fhandle, r.offset, r.rlen, 0x00)
+without_pathid(r::WriteRequest) = WriteRequest(r.fhandle, r.offset, r.data, 0x00)

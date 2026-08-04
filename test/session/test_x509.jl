@@ -1,9 +1,12 @@
 # X.509 client credentials: the discovery order the grid tools use, the
 # failure modes that must not be silent, and a real mutual-TLS handshake
 # against a server that requires a client certificate.
+#
+# `with_prompter` comes from session/test_prompt.jl, which runs first.
 
 using XRootD: Session
 using XRootD.Session:
+    CredentialRequest,
     X509Credentials,
     discover_x509,
     x509_proxy_candidates,
@@ -251,6 +254,54 @@ end
                     e
                 end
                 @test err isa ErrorException && occursin("proxy", err.msg)
+            end
+
+            @testset "a passphrase-encrypted key is asked about, not refused" begin
+                locked = joinpath(dir, "locked.key")
+                run(
+                    pipeline(
+                        `openssl pkcs8 -topk8 -in $clientkey -out $locked
+                         -passout pass:hunter2 -v2 aes-256-cbc`;
+                        stdout=devnull,
+                        stderr=devnull,
+                    ),
+                )
+                chmod(locked, 0o600)
+                @test encrypted_key(locked)
+                creds = X509Credentials(clientcert, locked)
+                fresh() = OpenSSL.SSLContext(OpenSSL.TLSClientMethod())
+
+                asked = CredentialRequest[]
+                with_prompter(r -> (push!(asked, r); "hunter2")) do
+                    @test use_x509!(fresh(), creds) isa OpenSSL.SSLContext
+                    @test length(asked) == 1
+                    @test asked[1].kind === :passphrase
+                    @test asked[1].secret          # never echoed back at the user
+                    @test occursin(locked, asked[1].reason)
+                    # Asked once and remembered against the key it unlocks: a
+                    # redirect chain builds a context per hop from the same file.
+                    @test use_x509!(fresh(), creds) isa OpenSSL.SSLContext
+                    @test length(asked) == 1
+                end
+
+                tries = 0
+                with_prompter(_ -> (tries += 1; "wrong")) do
+                    # A passphrase that does not decrypt is forgotten, so the
+                    # next attempt asks again rather than replaying it.
+                    @test_throws ErrorException use_x509!(fresh(), creds)
+                    @test_throws ErrorException use_x509!(fresh(), creds)
+                    @test tries == 2
+                end
+
+                withenv("XRDC_NO_PROMPT" => "1") do
+                    err = try
+                        use_x509!(fresh(), creds)
+                    catch e
+                        e
+                    end
+                    @test err isa ErrorException
+                    @test occursin("no passphrase was given", err.msg)
+                end
             end
 
             @testset "mutual TLS handshake" begin

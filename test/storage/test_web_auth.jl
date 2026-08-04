@@ -2,8 +2,8 @@
 # certificates over HTTPS, MKCOL/MOVE/COPY, and WLCG HTTP third-party copy.
 #
 # make_test_pki, start_mtls_server, recording and RequestLog are defined in
-# test/session/test_x509.jl, and `header` in test/storage/test_storage.jl;
-# all are shared via Main.
+# test/session/test_x509.jl, `with_prompter` in test/session/test_prompt.jl,
+# and `header` in test/storage/test_storage.jl; all are shared via Main.
 
 using XRootD.Storage
 using XRootD.Storage:
@@ -21,7 +21,9 @@ using XRootD.Storage:
     parse_propfind,
     dav_destination,
     web_client,
+    web_authorize!,
     WebBackend
+using XRootD.Session: CredentialRequest
 using XRootD.Tools: ensure_dir
 using HTTP: HTTP
 
@@ -373,6 +375,66 @@ end
                     close(server)
                 end
             end
+        end
+
+        @testset "a 401 is the endpoint asking for a credential" begin
+            mktempdir() do dir
+                ca, (servercert, serverkey), (clientcert, clientkey) = make_test_pki(dir)
+                seen = String[]
+                handler = function (req)
+                    auth = HTTP.header(req, "Authorization", "")
+                    push!(seen, auth)
+                    isempty(auth) && return HTTP.Response(401, "who are you")
+                    return HTTP.Response(200, "payload")
+                end
+                server = start_mtls_server(ca, servercert, serverkey, handler)
+                port = HTTP.port(server)
+                https(path) = storage_for(
+                    "https://localhost:$port/$path";
+                    cert=clientcert,
+                    key=clientkey,
+                    cafile=ca,
+                    use_token=false,
+                )
+                try
+                    b = https("obj")
+                    sink = IOBuffer()
+                    asked = CredentialRequest[]
+                    with_prompter(r -> (push!(asked, r); "typed.token")) do
+                        @test storage_read(b, sink) == :ok
+                    end
+                    @test String(take!(sink)) == "payload"
+                    @test seen == ["", "Bearer typed.token"]
+                    @test length(asked) == 1 && asked[1].kind === :token
+                    @test occursin("401", asked[1].reason)
+                    # Kept on the backend: the requests that follow carry it,
+                    # and so does a third-party copy delegating from here.
+                    @test b.token == "typed.token"
+                    @test ("Authorization" => "Bearer typed.token") in b.headers
+
+                    empty!(seen)
+                    declined = https("obj")
+                    with_prompter(_ -> nothing) do
+                        @test storage_read(declined, IOBuffer()) == :error
+                    end
+                    @test seen == [""]          # asked once, not retried blindly
+                    @test declined.token === nothing
+                finally
+                    close(server)
+                end
+            end
+        end
+    end
+
+    @testset "a credential is never typed into a cleartext connection" begin
+        with_prompter(_ -> "typed.token") do
+            @test web_authorize!(storage_for("http://example.org/obj")) === nothing
+            # Nor asked for twice: an endpoint that refuses the credential it
+            # was already sent is not answered by typing the same kind again.
+            already = storage_for("https://example.org/obj"; token="explicit")
+            @test web_authorize!(already) === nothing
+            @test web_authorize!(storage_for("https://example.org/obj"; use_token=false)) ==
+                ("Authorization" => "Bearer typed.token")
         end
     end
 end
