@@ -63,16 +63,67 @@ function decode_redirect(body::AbstractVector{UInt8})
 end
 
 """
-    decode_protocol(body) -> (; pval::UInt32, flags::UInt32)
+    decode_protocol(body) ->
+        (; pval, flags, secver, secopt, seclvl, secvec)
 
 Decode a `kXR_protocol` response body (`ServerProtocolBody`): the server's
-protocol version and its type/TLS-requirement flags.
+protocol version and its type/TLS-requirement flags, plus the optional
+`ServerResponseReqs_Protocol` trailer a server sends when the client asked
+for security requirements (`kXR_secreqs`). The trailer — 6 bytes tagged `'S'`
+followed by `secvsz` per-request pairs — carries the signing contract:
+`secver` (the signature scheme, 0 today), `secopt` (`kXR_secOData` /
+`kXR_secOFrce` bits), `seclvl` (how much must be signed), and `secvec`, the
+per-request overrides as `(opcode, requirement)` pairs where the requirement
+is `kXR_signIgnore`/`kXR_signLikely`/`kXR_signNeeded`. The record usually is
+the whole trailer, but BriX prefixes it with a security-methods block (see
+[`find_sec_reqs`](@ref)) and it is honoured there too. A body without the
+record — or with a malformed one — decodes to level 0 and no overrides:
+the same "nothing need be signed" a pre-signing server means.
 """
 function decode_protocol(body::AbstractVector{UInt8})
     if length(body) < 8
         throw(ArgumentError("kXR_protocol body needs ≥ 8 bytes, got $(length(body))"))
     end
-    return (; pval=get_u32(body, 1), flags=get_u32(body, 5))
+    secver = UInt8(0)
+    secopt = UInt8(0)
+    seclvl = UInt8(0)
+    secvec = Tuple{UInt16,UInt8}[]
+    s = find_sec_reqs(body)
+    if s !== nothing
+        secver = body[s + 2]
+        secopt = body[s + 3]
+        seclvl = body[s + 4]
+        secvsz = Int(body[s + 5])
+        if length(body) >= s + 5 + 2 * secvsz
+            for i in 0:(secvsz - 1)
+                reqindx = body[s + 6 + 2i]
+                reqsreq = body[s + 7 + 2i]
+                push!(secvec, (kXR_auth + UInt16(reqindx), reqsreq))
+            end
+        end
+    end
+    return (; pval=get_u32(body, 1), flags=get_u32(body, 5), secver, secopt, seclvl, secvec)
+end
+
+"""
+    find_sec_reqs(body) -> Int | nothing
+
+Locate the `ServerResponseReqs_Protocol` record in a `kXR_protocol` body,
+returning the index of its `'S'` tag. Two on-wire shapes carry it: the spec
+shape, where the record is the whole post-`flags` trailer, and a vendor
+shape (BriX) that prefixes it with a 4-byte security-methods header
+`[rsvd, required, count, rsvd]` followed by `count` 8-byte method entries.
+Anything else returns `nothing` — "no security requirements", which is how
+XrdCl reads a trailer it does not recognise.
+"""
+function find_sec_reqs(body::AbstractVector{UInt8})
+    n = length(body) - 8
+    n >= 6 && body[9] == UInt8('S') && return 9
+    if n >= 4
+        off = 4 + Int(body[11]) * 8
+        n >= off + 6 && body[9 + off] == UInt8('S') && return 9 + off
+    end
+    return nothing
 end
 
 """

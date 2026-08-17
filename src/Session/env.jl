@@ -157,24 +157,34 @@ function data_streams()
 end
 
 """
-Authentication mechanisms in the order they are tried, best first. `ztn`
+The authentication mechanisms this client implements, best first. `ztn`
 (bearer token) before `sss` (shared secret) before `unix` (an assertion the
-server may or may not believe).
+server may or may not believe). With no explicit order in play this is a
+*filter*, not an order: the server's own preference list decides which of
+these is tried first ([`authenticate`](@ref)).
 """
 const DEFAULT_AUTH_ORDER = ("ztn", "sss", "unix")
 
 """
-    auth_order() -> Vector{String}
+    env_auth_order() -> Union{Vector{String},Nothing}
 
-The mechanisms to try, best first. `\$XrdSecPROTOCOL` — XrdCl's own variable,
-comma- or space-separated — both orders and restricts them: a mechanism it
-leaves out is not tried at all, which is how a site pins a job to tokens even
-though the server would have accepted an anonymous `unix` login. Names it
-lists that this client does not implement are kept, ignored on the way past,
-and reported if nothing else works.
+The mechanism order `\$XrdSecPROTOCOL` — XrdCl's own variable, comma- or
+space-separated — imposes, or `nothing` when it is unset. When set it both
+orders and restricts: a mechanism it leaves out is not tried at all, which is
+how a site pins a job to tokens even though the server would have accepted an
+anonymous `unix` login. Names it lists that this client does not implement
+are kept, ignored on the way past, and reported if nothing else works.
 """
-function auth_order()
+function env_auth_order()
     v = get(ENV, "XrdSecPROTOCOL", "")
     names = [lowercase(strip(s)) for s in split(v, r"[,\s]+") if !isempty(strip(s))]
-    return isempty(names) ? collect(String, DEFAULT_AUTH_ORDER) : names
+    return isempty(names) ? nothing : names
 end
+
+"""
+    auth_order() -> Vector{String}
+
+[`env_auth_order`](@ref) when `\$XrdSecPROTOCOL` says something, else the
+built-in [`DEFAULT_AUTH_ORDER`](@ref).
+"""
+auth_order() = something(env_auth_order(), collect(String, DEFAULT_AUTH_ORDER))

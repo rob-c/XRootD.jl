@@ -72,6 +72,55 @@ using XRootD.Wire:
         p = decode_protocol(UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01])
         @test p.pval == 0x00000520
         @test p.flags == 0x00000001
+        # No trailer decodes to the pre-signing contract: nothing to sign.
+        @test p.seclvl == 0
+        @test p.secopt == 0
+        @test isempty(p.secvec)
+
+        # The 'S' security trailer: secver 0, kXR_secOData, level 2, and one
+        # secvec pair naming kXR_stat (kXR_auth + 0x11) as always-signed.
+        trailer = UInt8[UInt8('S'), 0x00, 0x00, Wire.kXR_secOData, 0x02, 0x01, 0x11, 0x02]
+        ps = decode_protocol(
+            vcat(UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01], trailer)
+        )
+        @test ps.secver == 0
+        @test ps.secopt == Wire.kXR_secOData
+        @test ps.seclvl == 2
+        @test ps.secvec == [(Wire.kXR_stat, Wire.kXR_signNeeded)]
+
+        # BriX prefixes the 'S' record with a security-methods header —
+        # [rsvd, required, count, rsvd] then count 8-byte entries — and the
+        # record must be honoured there too, or the signing contract the
+        # server just stated decodes as "nothing need be signed".
+        vendor = vcat(UInt8[0x00, 0x01, 0x02, 0x00], zeros(UInt8, 16))
+        pv = decode_protocol(
+            vcat(UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01], vendor, trailer)
+        )
+        @test pv.secopt == Wire.kXR_secOData
+        @test pv.seclvl == 2
+        @test pv.secvec == [(Wire.kXR_stat, Wire.kXR_signNeeded)]
+
+        # A method count pointing past the body names no record at all.
+        pcount = decode_protocol(
+            vcat(
+                UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01],
+                UInt8[0x00, 0x01, 0x07, 0x00],
+                zeros(UInt8, 16),
+            )
+        )
+        @test pcount.seclvl == 0 && isempty(pcount.secvec)
+
+        # A tag that is not 'S' is not a trailer, and a secvec the body cannot
+        # hold is dropped whole rather than read past the end.
+        pt = decode_protocol(
+            vcat(UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01], zeros(UInt8, 8))
+        )
+        @test pt.seclvl == 0 && isempty(pt.secvec)
+        short = UInt8[UInt8('S'), 0x00, 0x00, 0x00, 0x03, 0x02, 0x0c, 0x02]  # says 2 pairs
+        pshort = decode_protocol(
+            vcat(UInt8[0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x01], short)
+        )
+        @test pshort.seclvl == 3 && isempty(pshort.secvec)
 
         sessid = UInt8.(1:16)
         l = decode_login(sessid)

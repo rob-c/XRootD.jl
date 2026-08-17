@@ -1,6 +1,6 @@
 using XRootD: Wire, Session
 using XRootD.Session: Blowfish
-using SHA: hmac_sha256
+using SHA: sha256
 
 # CFB64 decryption helper for the round-trip test (feedback taken from the
 # ciphertext, mirroring encrypt).
@@ -206,6 +206,15 @@ end
             @test cred !== nothing
             @test cred[1:4] == UInt8['s', 's', 's', 0x00]
             @test Wire.get_u64(cred, 9) == 77
+
+            # sss_material hands back the key beside the blob — the sigver
+            # session cipher — and the blob is the same mint sss_credential does.
+            m = Session.sss_material(; keytab=good, username="alice")
+            @test m !== nothing
+            @test m.key.id == 77
+            @test length(m.key.key) == 16
+            @test m.cred[1:16] == cred[1:16]
+            @test Session.sss_material(; keytab=joinpath(dir, "absent")) === nothing
         end
     end
 
@@ -246,26 +255,86 @@ end
 end
 
 @testset "sigver" begin
-    key = collect(0x01:0x20)
     hdr = collect(0x00:0x17)          # 24-byte request header
     payload = UInt8[0xaa, 0xbb]
-    mac = Session.sigver_hmac(key, UInt64(1), hdr, payload)
-    # reference HMAC over seqno_be || hdr || payload
-    msg = vcat(UInt8[0, 0, 0, 0, 0, 0, 0, 1], hdr, payload)
-    @test mac == hmac_sha256(key, msg)
-    @test length(mac) == 32
 
-    @test Session.sigver_required(Wire.kXR_write)
-    @test Session.sigver_required(Wire.kXR_open)
-    @test !Session.sigver_required(Wire.kXR_stat)
-    @test !Session.sigver_required(Wire.kXR_read)
+    @testset "the secver-0 hash kernel" begin
+        h = Session.sigver_hash(UInt64(1), hdr, payload)
+        # reference: SHA-256 over seqno_be || hdr || payload
+        @test h == sha256(vcat(UInt8[0, 0, 0, 0, 0, 0, 0, 1], hdr, payload))
+        @test length(h) == 32
+        # nodata leaves the payload out — the write-data exclusion.
+        @test Session.sigver_hash(UInt64(1), hdr, payload; nodata=true) ==
+            sha256(vcat(UInt8[0, 0, 0, 0, 0, 0, 0, 1], hdr))
+    end
 
-    # the codec: dlen = 32, payload = the HMAC
-    frame = Wire.encode(Wire.SigverRequest(Wire.kXR_write, UInt64(5), mac), UInt16(7))
-    @test frame[3:4] == UInt8[0x0b, 0xd5]        # kXR_sigver (3029 = 0x0bd5)
-    @test Wire.get_u16(frame, 5) == Wire.kXR_write
-    @test Wire.get_u64(frame, 9) == 5
-    @test frame[17] == Wire.kXR_SHA256_sig
-    @test Wire.get_u32(frame, 21) == 32
-    @test frame[25:end] == mac
+    @testset "which requests must be signed" begin
+        # Level 2 signs the modifying set and nothing else.
+        @test Session.sigver_required(Wire.kXR_write, 2)
+        @test Session.sigver_required(Wire.kXR_open, 2)
+        @test Session.sigver_required(Wire.kXR_clone, 2)
+        @test !Session.sigver_required(Wire.kXR_stat, 2)
+        @test !Session.sigver_required(Wire.kXR_read, 2)
+        @test !Session.sigver_required(Wire.kXR_set, 2)
+        # Below 2 nothing is signed; 3 and up sign everything non-exempt.
+        @test !Session.sigver_required(Wire.kXR_write, 1)
+        @test !Session.sigver_required(Wire.kXR_write, 0)
+        @test Session.sigver_required(Wire.kXR_read, 3)
+        @test Session.sigver_required(Wire.kXR_stat, 4)
+        # The exempt set is absolute — even a kXR_signNeeded override cannot
+        # demand a signature on the requests that precede the session key.
+        for op in (
+            Wire.kXR_login,
+            Wire.kXR_protocol,
+            Wire.kXR_auth,
+            Wire.kXR_endsess,
+            Wire.kXR_ping,
+            Wire.kXR_sigver,
+            Wire.kXR_bind,
+        )
+            @test !Session.sigver_required(op, 4)
+            @test !Session.sigver_required(
+                op, 4; overrides=Dict(op => Wire.kXR_signNeeded)
+            )
+        end
+        # secvec overrides: Needed signs at any level, Ignore never signs,
+        # Likely defers to the level table.
+        ov = Dict(
+            Wire.kXR_stat => Wire.kXR_signNeeded, Wire.kXR_write => Wire.kXR_signIgnore
+        )
+        @test Session.sigver_required(Wire.kXR_stat, 0; overrides=ov)
+        @test !Session.sigver_required(Wire.kXR_write, 2; overrides=ov)
+        @test Session.sigver_required(
+            Wire.kXR_open, 2; overrides=Dict(Wire.kXR_open => Wire.kXR_signLikely)
+        )
+    end
+
+    @testset "the encrypted blob and the codec" begin
+        key = collect(0x01:0x20)
+        h = Session.sigver_hash(UInt64(5), hdr, payload)
+        blob = Session.bf32_encrypt(key, h)
+        @test length(blob) == 36                     # 32-byte hash + CRC32
+        # bf32's zero IV makes it deterministic, which is what lets a
+        # verifier check by re-encrypting instead of decrypting.
+        @test blob == Session.bf32_encrypt(key, h)
+        clear = _bf_cfb64_decrypt(Blowfish.Context(key), blob)
+        @test clear[1:32] == h
+        crc = Session.crc32_ieee(h)
+        @test clear[33:36] == UInt8[
+            (crc >> 24) % UInt8, (crc >> 16) % UInt8, (crc >> 8) % UInt8, crc % UInt8
+        ]
+
+        frame = Wire.encode(Wire.SigverRequest(Wire.kXR_write, UInt64(5), blob), UInt16(7))
+        @test frame[3:4] == UInt8[0x0b, 0xd5]        # kXR_sigver (3029 = 0x0bd5)
+        @test Wire.get_u16(frame, 5) == Wire.kXR_write
+        @test frame[8] == 0x00
+        @test Wire.get_u64(frame, 9) == 5
+        @test frame[17] == Wire.kXR_SHA256_sig
+        @test Wire.get_u32(frame, 21) == 36
+        @test frame[25:end] == blob
+        nodata = Wire.encode(
+            Wire.SigverRequest(Wire.kXR_write, UInt64(6), blob; nodata=true), UInt16(7)
+        )
+        @test nodata[8] == Wire.kXR_nodata_sig
+    end
 end

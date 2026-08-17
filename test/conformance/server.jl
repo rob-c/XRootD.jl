@@ -55,6 +55,10 @@ Base.@kwdef mutable struct ConfServer
     next_pathid::UInt8 = 0x01
     refuse_bind::Bool = false   # answer the next kXR_bind with an error
     bind_zero::Bool = false     # hand out path id 0, the control link's own
+    substreams_rw::Bool = false # answer the brix.substreams probe with "=rw"
+    path_ops::Vector{UInt16} = UInt16[] # requests that arrived whole on a bound path
+    refuse_routed_write::Bool = false   # kXR_Unsupported for path-routed writes
+    routed_write_refusals::Int = 0      # how many such refusals were sent
 end
 
 "The 16-byte session id this server hands out at login and demands at bind."
@@ -86,6 +90,10 @@ function conf_reset!(srv::ConfServer)
     srv.fail_close = false
     srv.refuse_bind = false
     srv.bind_zero = false
+    srv.substreams_rw = false
+    empty!(srv.path_ops)
+    srv.refuse_routed_write = false
+    srv.routed_write_refusals = 0
     return srv
 end
 
@@ -218,7 +226,9 @@ can assert which identity was presented and to whom.
 `bind_ok` also accepts a connection that ends its bring-up with `kXR_bind`
 instead of `kXR_login` — an extra data path for a session that already
 exists. Returns the path id assigned, or `0x00` for an ordinary login, so
-the caller knows which kind of connection it is now serving.
+the caller knows which kind of connection it is now serving. Servers without
+`bind_ok` refuse the bind with `kXR_error` — it is not a violation, this
+server just has no path plumbing — and the connection ends there.
 """
 function serve_bringup(srv, sock; bind_ok::Bool=false)
     hello = read(sock, 20)
@@ -235,8 +245,13 @@ function serve_bringup(srv, sock; bind_ok::Bool=false)
     )
     lf, _ = cs_take(sock)
     rid = Wire.get_u16(lf, 3)
-    if bind_ok && rid == Wire.kXR_bind
-        return serve_bind(srv, sock, Wire.get_u16(lf, 1), lf)
+    if rid == Wire.kXR_bind
+        bind_ok && return serve_bind(srv, sock, Wire.get_u16(lf, 1), lf)
+        # A bind is a legitimate request, just not on offer here — refuse it
+        # and the client falls back to the control link without failing the
+        # open that asked for the extra stream.
+        cs_error(sock, Wire.get_u16(lf, 1), 3000, "no data paths available")
+        throw(EOFError())
     end
     rid == Wire.kXR_login || flag!(srv, "bring-up: expected kXR_login")
     # The username sits in the 8-byte NUL-padded header field, not the body.
@@ -341,6 +356,15 @@ function serve_write(srv::ConfServer, sock, sid, frame, payload)
     # byte 17 is the path id, 18:20 are reserved — the data itself has already
     # been taken off whichever link byte 17 named (`cs_take_routed`).
     all(==(0x00), frame[18:20]) || flag!(srv, "kXR_write: reserved bytes are not zero")
+    if srv.refuse_routed_write && frame[17] != 0x00
+        # A proxy that binds paths but cannot take writes over them (the case
+        # BriX documents). The data was already consumed off the path, so the
+        # streams stay in step; nothing was stored.
+        srv.routed_write_refusals += 1
+        return cs_error(
+            sock, sid, Int(Wire.kXR_Unsupported), "writes are not supported on data paths"
+        )
+    end
     srv.fail_write && return cs_error(sock, sid, 3016, "write failed")
     apply_write!(srv, offset, payload)
     return cs_ok(sock, sid)
@@ -502,15 +526,49 @@ function serve_pgwrite(srv::ConfServer, sock, sid, frame, payload)
     )
 end
 
+"""
+Serve whole request frames off a bound data path — the mode a server that
+answered the `brix.substreams` probe with `=rw` speaks. Only the bulk
+carriers arrive here, their data inline and their path id zeroed: naming a
+path id in a frame already riding that path would ask for the data to be
+routed a second time, so it is flagged.
+"""
+function serve_path_requests(srv::ConfServer, sock)
+    while isopen(sock)
+        frame, payload = cs_take(sock)
+        sid, rid = Wire.get_u16(frame, 1), Wire.get_u16(frame, 3)
+        sid == 0x0000 && flag!(srv, "$(Wire.request_name(rid)): streamid 0")
+        push!(srv.ops, rid)
+        push!(srv.path_ops, rid)
+        if rid == Wire.kXR_read
+            isempty(payload) ||
+                flag!(srv, "path kXR_read: optional args on a whole-frame path")
+            serve_read(srv, sock, sid, frame)
+        elseif rid == Wire.kXR_write
+            frame[17] == 0x00 ||
+                flag!(srv, "path kXR_write: names path id $(frame[17]) on the path")
+            serve_write(srv, sock, sid, frame, payload)
+        else
+            flag!(srv, "unexpected $(Wire.request_name(rid)) on a data path")
+            cs_error(sock, sid, 3000, "unsupported")
+        end
+    end
+    return nothing
+end
+
 function serve_conn(srv::ConfServer, sock)
     try
         pathid = serve_bringup(srv, sock; bind_ok=true)
         if pathid != 0x00
-            # A bound data path carries data, never requests: it must stay
-            # unread here, or the write bytes destined for it would be
-            # consumed as request headers.
-            while isopen(sock)
-                sleep(0.02)
+            if srv.substreams_rw
+                serve_path_requests(srv, sock)
+            else
+                # A bound data path carries data, never requests: it must stay
+                # unread here, or the write bytes destined for it would be
+                # consumed as request headers.
+                while isopen(sock)
+                    sleep(0.02)
+                end
             end
             return nothing
         end
@@ -558,6 +616,20 @@ function serve_conn(srv::ConfServer, sock)
                 end
             elseif rid == Wire.kXR_ping
                 cs_ok(sock, sid)
+            elseif rid == Wire.kXR_query
+                infotype = Wire.get_u16(frame, 5)
+                if infotype == Wire.kXR_Qconfig
+                    # Stock XrdXrootd answers one "key=value\n" line per query
+                    # key and echoes the bare key back when it has no value —
+                    # which is exactly what an old server does to the
+                    # brix.substreams probe.
+                    key = String(rstrip(String(copy(payload)), ['\0', '\n']))
+                    val = key == "brix.substreams" && srv.substreams_rw ? "$key=rw" : key
+                    cs_ok(sock, sid, Vector{UInt8}(codeunits(val * "\n")))
+                else
+                    flag!(srv, "kXR_query: unexpected infotype $infotype")
+                    cs_error(sock, sid, 3000, "unsupported query")
+                end
             else
                 flag!(srv, "unexpected request $(Wire.request_name(rid)) ($rid)")
                 cs_error(sock, sid, 3000, "unsupported")

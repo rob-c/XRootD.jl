@@ -186,7 +186,11 @@ end
             end
             data = copy(get(stored, req.target, UInt8[]))
             isempty(data) && return HTTP.Response(404)
-            data[1] ⊻= 0x01          # a store that quietly returns other bytes
+            if endswith(req.target, "/t.bin")
+                pop!(data)           # a store that quietly lost the tail
+            else
+                data[1] ⊻= 0x01      # a store that quietly returns other bytes
+            end
             return HTTP.Response(200, data)
         end
         server = HTTP.serve!(handler, "127.0.0.1", 0; verbose=false)
@@ -198,6 +202,11 @@ end
             ok, msg = copyfile(src, "http://127.0.0.1:$port/v.bin"; verify=true)
             @test !ok
             @test msg == "checksum mismatch after copy"
+            # A destination that truncated says so in bytes: the size check
+            # fires before the checksum mismatch the truncation also causes.
+            ok, msg = copyfile(src, "http://127.0.0.1:$port/t.bin"; verify=true)
+            @test !ok
+            @test msg == "size mismatch after copy: destination holds 2047 of 2048 bytes"
             # Without verify the same copy is reported as a success — which is
             # exactly why verify exists.
             ok, _ = copyfile(src, "http://127.0.0.1:$port/v2.bin")

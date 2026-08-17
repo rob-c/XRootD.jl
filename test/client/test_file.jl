@@ -122,10 +122,28 @@ end
         f = File("$base//data", OpenFlags.Update)
         st, _ = write(f, "payload")
         @test isOK(st)
+        # an overwrite inside the recorded size leaves it alone
+        @test f.filesize == length(MOCK_CONTENT)
         st, _ = truncate(f, 4)
         @test isOK(st)
+        # truncate re-declares the size outright
+        @test f.filesize == 4
         st, _ = sync(f)
         @test isOK(st)
+        close(f)
+    end
+
+    @testset "a write past the end moves eof with it" begin
+        f = File("$base//data", OpenFlags.Update)
+        st, _ = readlines(f)
+        @test isOK(st)
+        @test eof(f)
+        # the handle itself appended, so its own eof answer must move — a
+        # cursor at the old end is now mid-file, not at it
+        st, _ = write(f, "tail", length(MOCK_CONTENT))
+        @test isOK(st)
+        @test !eof(f)
+        @test f.filesize == length(MOCK_CONTENT) + 4
         close(f)
     end
 

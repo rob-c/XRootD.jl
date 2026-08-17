@@ -104,7 +104,15 @@ individual writes returned.
 """
 function storage_write(b::XRootDBackend, source::IO; length=nothing)
     f = XrdCl.File()
-    st, _ = open(f, file_url(b), XrdCl.OpenFlags.Write | XrdCl.OpenFlags.Delete; b.creds...)
+    # Update rather than Write: kXR_open_wrto is write-ONLY mode, which some
+    # servers refuse to combine with the read-back a verifying caller does.
+    # MakePath spares the caller pre-creating the object's directory.
+    st, _ = open(
+        f,
+        file_url(b),
+        XrdCl.OpenFlags.Update | XrdCl.OpenFlags.Delete | XrdCl.OpenFlags.MakePath;
+        b.creds...,
+    )
     XrdCl.isOK(st) || return :error
     ok = true
     try
@@ -194,7 +202,12 @@ end
 function open_write_handle(b::XRootDBackend, total)
     url = file_url(b)
     f = XrdCl.File()
-    st, _ = open(f, url, XrdCl.OpenFlags.Write | XrdCl.OpenFlags.Delete; b.creds...)
+    st, _ = open(
+        f,
+        url,
+        XrdCl.OpenFlags.Update | XrdCl.OpenFlags.Delete | XrdCl.OpenFlags.MakePath;
+        b.creds...,
+    )
     XrdCl.isOK(st) || throw(StorageError(url, "open", string(st)))
     return XRootDStream(f, url, total === nothing ? Int64(-1) : Int64(total), true)
 end

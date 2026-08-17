@@ -246,8 +246,14 @@ function copyfile(
     end
 
     if verify
-        vcode, vcrc, _ = checksum_object(dst)
+        vcode, vcrc, vbytes = checksum_object(dst)
         vcode == :ok || return false, "verify read failed ($vcode): $dst_url"
+        # Size first: a destination that truncated or padded says so in bytes,
+        # which is a better message than the checksum mismatch it also causes.
+        if vbytes != nbytes
+            return false,
+            "size mismatch after copy: destination holds $vbytes of $nbytes bytes"
+        end
         vcrc == crc || return false, "checksum mismatch after copy"
     end
     return true, "copied $nbytes bytes"

@@ -94,8 +94,12 @@ function tpc_copy(
             "tpc.ttl" => string(TPC_TTL),
         ],
     )
+    # Update rather than Write: kXR_open_wrto asks for write-ONLY mode, and a
+    # TPC destination that cannot be read back cannot be checksummed either.
     flags =
-        XrdCl.OpenFlags.Write | (overwrite ? XrdCl.OpenFlags.Delete : XrdCl.OpenFlags.New)
+        XrdCl.OpenFlags.Update |
+        XrdCl.OpenFlags.MakePath |
+        (overwrite ? XrdCl.OpenFlags.Delete : XrdCl.OpenFlags.New)
     d = XrdCl.File()
     st, _ = open(d, copyurl, flags; dst.creds...)
     XrdCl.isOK(st) || return tpc_open_result(st, "destination copy open failed")

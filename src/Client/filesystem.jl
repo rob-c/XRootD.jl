@@ -285,6 +285,11 @@ end
 
 List the locations of a file or directory (`flags` from `OpenFlags`, e.g.
 `OpenFlags.Refresh`). Returns `(status, Vector{Location} | nothing)`.
+
+The path goes to the server verbatim, which includes XrdCl's convention of
+prefixing it with `*` — `"*/store/f.root"` asks a redirector to pick a server
+where the file *could be created* rather than failing because it does not
+exist yet, and `"*"` alone asks for any server at all.
 """
 function locate(fs::FileSystem, path::String, flags::Integer, timeout::UInt16=0x0000)
     st, body = perform(fs, Wire.LocateRequest(path; options=UInt16(flags)))

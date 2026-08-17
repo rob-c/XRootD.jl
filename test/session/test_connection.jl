@@ -43,7 +43,15 @@ function serve_bringup(sock)
     preq, _ = read_request(sock)                          # kXR_protocol
     @assert req_id(preq) == Wire.kXR_protocol
     write(sock, vcat(resp_hdr(req_sid(preq), Wire.kXR_ok, 8), be32(0x520), be32(1)))
-    lreq, _ = read_request(sock)                          # kXR_login
+    lreq, _ = read_request(sock)                          # kXR_login or kXR_bind
+    if req_id(lreq) == Wire.kXR_bind
+        # This mock has no data-path plumbing: refuse the extra stream a
+        # default open asks for, and the file stays on its control link.
+        body = vcat(be32(3000), Vector{UInt8}(codeunits("no data paths here")))
+        write(sock, vcat(resp_hdr(req_sid(lreq), Wire.kXR_error, length(body)), body))
+        close(sock)
+        throw(EOFError())
+    end
     @assert req_id(lreq) == Wire.kXR_login
     write(sock, vcat(resp_hdr(req_sid(lreq), Wire.kXR_ok, 16), UInt8.(1:16)))
     return nothing
@@ -169,6 +177,17 @@ function serve_bad_bringup(sock, stage::Symbol)
     return write(sock, refuse(req_sid(lreq)))
 end
 
+"Serve a login refused with kXR_TLSRequired: the server insists on encryption."
+function serve_tls_required(sock)
+    read(sock, 20)                                        # client hello
+    write(sock, vcat(resp_hdr(0x0000, Wire.kXR_ok, 8), be32(0x310), be32(1)))
+    preq, _ = read_request(sock)
+    write(sock, vcat(resp_hdr(req_sid(preq), Wire.kXR_ok, 8), be32(0x520), be32(1)))
+    lreq, _ = read_request(sock)
+    body = vcat(be32(Int(Wire.kXR_TLSRequired)), Vector{UInt8}(codeunits("TLS required")))
+    return write(sock, vcat(resp_hdr(req_sid(lreq), Wire.kXR_error, length(body)), body))
+end
+
 "Start a server that runs `handler(sock)` per connection; returns (server, port)."
 function start_server(handler)
     server = listen(ip"127.0.0.1", 0)
@@ -219,6 +238,8 @@ function dead_connection(sock::IO=DeadTransport())
         nothing,
         false,
         0,
+        0x00,
+        Dict{UInt16,UInt8}(),
         nothing,
         UInt64(0),
         time(),
@@ -226,6 +247,7 @@ function dead_connection(sock::IO=DeadTransport())
         0,
         Dict{UInt8,Session.DataPath}(),
         Dict{UInt16,UInt8}(),
+        nothing,
     )
 end
 
@@ -363,6 +385,60 @@ end
                 close(server)
             end
         end
+    end
+
+    @testset "a login refused for want of TLS is retried with TLS" begin
+        # The mock refuses the cleartext login with kXR_TLSRequired. The
+        # client's answer is a fresh connection asking for TLS — which this
+        # mock cannot offer, so the failure reported is the TLS-availability
+        # error from the SECOND bring-up, not the login refusal from the
+        # first. That second message is the proof the retry happened.
+        server, tlsport = start_server(serve_tls_required)
+        try
+            err = try
+                Session.connect("127.0.0.1", tlsport; username="tester")
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("TLS required but the server", err.msg)
+        finally
+            close(server)
+        end
+    end
+
+    @testset "sign_frame follows the armed contract" begin
+        # White-box: the signing gate as transmit() consults it.
+        c = dead_connection()
+        fh = (0x09, 0x09, 0x09, 0x09)
+        frame = Wire.encode(Wire.WriteRequest(fh, Int64(0), UInt8[1, 2, 3]), UInt16(7))
+        # A level without a key signs nothing: there is nothing to encrypt with.
+        c.sec_level = 2
+        @test Session.sign_frame(c, frame) === nothing
+        # Key + level 2: the write is signed, the seqno advances, and the
+        # prefix reuses the covered request's streamid.
+        c.signing_key = collect(0x01:0x20)
+        sig = Session.sign_frame(c, frame)
+        @test sig !== nothing
+        @test Wire.get_u16(sig, 1) == 0x0007
+        @test Wire.get_u16(sig, 3) == Wire.kXR_sigver
+        @test Wire.get_u16(sig, 5) == Wire.kXR_write
+        @test Wire.get_u64(sig, 9) == 1
+        @test c.sig_seqno == 1
+        @test Wire.get_u32(sig, 21) == 36            # bf32(32-byte hash)
+        # Without kXR_secOData a write's payload stays out of the hash…
+        @test sig[8] == Wire.kXR_nodata_sig
+        # …and with data coverage demanded it goes in.
+        c.sec_opts = Wire.kXR_secOData
+        sig2 = Session.sign_frame(c, frame)
+        @test sig2 !== nothing && sig2[8] == 0x00
+        @test c.sig_seqno == 2
+        # A stat is outside the level-2 set — until the secvec says Needed.
+        sframe = Wire.encode(Wire.StatRequest("/x"), UInt16(8))
+        @test Session.sign_frame(c, sframe) === nothing
+        c.sec_overrides[Wire.kXR_stat] = Wire.kXR_signNeeded
+        @test Session.sign_frame(c, sframe) !== nothing
     end
 
     @testset "streamid allocation skips 0 and anything in flight" begin

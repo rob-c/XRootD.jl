@@ -40,6 +40,10 @@ mutable struct File
     # `rr` round-robins reads and writes across the live ones per request.
     pathids::Vector{UInt8}
     rr::Int
+    # Latched when the server answered a path-routed write with
+    # kXR_Unsupported: every later write stays inline on the control link,
+    # because a server that refused the routing once will refuse it again.
+    inline_writes::Bool
     owns_conn::Bool
 end
 
@@ -57,6 +61,7 @@ function File()
         0,
         UInt8[],
         0,
+        false,
         true,
     )
 end
@@ -399,7 +404,9 @@ Base.isopen(f::File) = f.isopen
 """
     Base.eof(f::File) -> Bool
 
-`true` once the read cursor has passed the size captured at open.
+`true` once the read cursor has passed the file's size as this handle knows
+it: captured at open, grown by writes past the end, reset by `truncate`.
+Another writer's appends are invisible until a fresh `stat`.
 """
 Base.eof(f::File) = f.currentOffset >= f.filesize
 
@@ -423,6 +430,7 @@ Truncate the open file to `size` bytes. Returns `(status, nothing)`.
 """
 function Base.truncate(f::File, size::Integer)
     st, _ = fperform(f, Wire.TruncateRequest("", Int64(size), f.fhandle))
+    isOK(st) && (f.filesize = Int64(size))
     return st, nothing
 end
 
@@ -525,9 +533,19 @@ Write `size` bytes of `data` at `offset`. Returns `(status, nothing)`.
 """
 function Base.write(f::File, data::Array{UInt8}, size, offset=0)
     payload = size == length(data) ? data : data[1:size]
-    st, _ = fperform(
-        f, Wire.WriteRequest(f.fhandle, Int64(offset), payload; pathid=data_pathid(f))
-    )
+    pid = f.inline_writes ? 0x00 : data_pathid(f)
+    st, _ = fperform(f, Wire.WriteRequest(f.fhandle, Int64(offset), payload; pathid=pid))
+    if isError(st) && st.code == Wire.kXR_Unsupported && pid != 0x00
+        # A server that took the bind but not writes routed over it (BriX
+        # documents proxies that do exactly this). The write never happened,
+        # so it is retried once inline at the same offset — and latched so
+        # the rest of the transfer does not pay a refused round trip each.
+        f.inline_writes = true
+        st, _ = fperform(f, Wire.WriteRequest(f.fhandle, Int64(offset), payload))
+    end
+    # A write past the recorded end grows the file, and `eof` answers from
+    # that record — without this it would still answer for the size at open.
+    isOK(st) && (f.filesize = max(f.filesize, Int64(offset) + length(payload)))
     return st, nothing
 end
 

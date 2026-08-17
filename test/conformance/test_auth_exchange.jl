@@ -2,12 +2,12 @@
 # chooses from what the server offers, what it puts in it, and what happens
 # when the server refuses it.
 #
-# The choice is the interesting part. A server states a set of acceptable
-# protocols and the client picks one; picking a weaker one than it could have,
-# or sending a credential for a protocol the server never offered, is a
-# security failure that leaves a perfectly healthy-looking session behind.
-# Ground truth for the preference order and payload shapes: libxrdc
-# sec/sec_{token,sss,unix}.c and PyXRootD's XrdSecProtocol selection.
+# The choice is the interesting part. A server states its acceptable
+# protocols in the order its authorization honours them, and the client works
+# down that list; ignoring the server's order, or sending a credential for a
+# protocol the server never offered, is a security failure that leaves a
+# perfectly healthy-looking session behind. Ground truth for the selection
+# and payload shapes: libxrdc sec/sec_{token,sss,unix}.c.
 
 using XRootD: Wire, Session
 using XRootD.Session: CredentialRequest
@@ -58,8 +58,14 @@ using XRootD.Session: CredentialRequest
     end
 
     @testset "ztn carries the bearer token itself" begin
+        # These mock servers speak plain TCP, and the client withholds a
+        # bearer token over cleartext; XRDC_ZTN_CLEARTEXT is the documented
+        # opt-out for a test bench that is its own network, so the ztn
+        # testsets here run under it.
         srv, port = start_auth_server(; sec="&P=ztn")
-        conn, err = withenv("BEARER_TOKEN" => "header.payload.signature") do
+        conn, err = withenv(
+            "BEARER_TOKEN" => "header.payload.signature", "XRDC_ZTN_CLEARTEXT" => "1"
+        ) do
             auth_bringup(port; username="tester")
         end
         @test err === nothing
@@ -71,7 +77,9 @@ using XRootD.Session: CredentialRequest
 
     @testset "the token given to the client wins over the environment" begin
         srv, port = start_auth_server(; sec="&P=ztn")
-        conn, err = withenv("BEARER_TOKEN" => "from.the.environment") do
+        conn, err = withenv(
+            "BEARER_TOKEN" => "from.the.environment", "XRDC_ZTN_CLEARTEXT" => "1"
+        ) do
             auth_bringup(port; username="tester", token="from.the.caller")
         end
         @test err === nothing
@@ -84,7 +92,7 @@ using XRootD.Session: CredentialRequest
         # A real trailer is "&P=ztn,v:10400&P=unix": everything after the comma
         # is the protocol's own parameters, not another protocol.
         srv, port = start_auth_server(; sec="&P=ztn,v:10400,x:1&P=unix")
-        conn, err = withenv("BEARER_TOKEN" => "tok") do
+        conn, err = withenv("BEARER_TOKEN" => "tok", "XRDC_ZTN_CLEARTEXT" => "1") do
             auth_bringup(port; username="tester")
         end
         @test err === nothing
@@ -93,26 +101,62 @@ using XRootD.Session: CredentialRequest
         close(conn)
     end
 
-    @testset "the strongest offered mechanism is the one used" begin
-        # Wire order is the server's, not a preference: ztn beats sss beats
-        # unix whichever way round they are listed.
+    @testset "a bearer token is not volunteered over cleartext" begin
+        # The token is a reusable secret and these connections are plain TCP:
+        # without the opt-out the client keeps it, falls back when it can, and
+        # names the withholding when it cannot — "the token was withheld" and
+        # "no token exists" need different fixes.
+        srv, port = start_auth_server(; sec="&P=ztn&P=unix")
+        conn, err = withenv(
+            "BEARER_TOKEN" => "secret.jwt", "XRDC_ZTN_CLEARTEXT" => nothing
+        ) do
+            auth_bringup(port; username="tester")
+        end
+        @test err === nothing
+        @test all(c[1] != "ztn" for c in srv.creds)
+        @test srv.creds[1][1] == "unix"
+        @test isempty(srv.violations)
+        close(conn)
+
+        srv, port = start_auth_server(; sec="&P=ztn")
+        asked = CredentialRequest[]
+        conn, err = withenv(
+            "BEARER_TOKEN" => "secret.jwt", "XRDC_ZTN_CLEARTEXT" => nothing
+        ) do
+            auth_bringup(port; username="tester", prompter=r -> (push!(asked, r); "typed"))
+        end
+        @test conn === nothing && err !== nothing
+        msg = sprint(showerror, err)
+        @test occursin("only sent over TLS", msg)
+        @test occursin("XRDC_ZTN_CLEARTEXT", msg)
+        @test isempty(srv.creds)     # the secret stayed on this side
+        @test isempty(asked)         # nor was anyone asked to type one it would not send
+        @test isempty(srv.violations)
+    end
+
+    @testset "the server's advertised order decides, not a client ranking" begin
+        # The trailer is built from the server's sec.protocol directives first
+        # to last: whichever mechanism it lists first is the one its
+        # authorization actually honours, so with everything satisfiable the
+        # first offer is the one answered.
         with_keytab() do keytab
-            for sec in ("&P=unix&P=sss&P=ztn", "&P=ztn&P=sss&P=unix")
+            for (sec, winner) in
+                (("&P=unix&P=sss&P=ztn", "unix"), ("&P=ztn&P=sss&P=unix", "ztn"))
                 srv, port = start_auth_server(; sec=sec)
-                conn, err = withenv("BEARER_TOKEN" => "tok") do
+                conn, err = withenv("BEARER_TOKEN" => "tok", "XRDC_ZTN_CLEARTEXT" => "1") do
                     auth_bringup(port; username="tester", keytab=keytab)
                 end
                 @test err === nothing
-                @test srv.creds[1][1] == "ztn"
+                @test srv.creds[1][1] == winner
                 @test isempty(srv.violations)
                 close(conn)
             end
         end
     end
 
-    @testset "sss is preferred to unix when a keytab key exists" begin
+    @testset "an offered sss is satisfied from the keytab" begin
         with_keytab(; id=42) do keytab
-            srv, port = start_auth_server(; sec="&P=unix&P=sss")
+            srv, port = start_auth_server(; sec="&P=sss&P=unix")
             conn, err = without_token() do
                 auth_bringup(port; username="tester", keytab=keytab)
             end
@@ -135,9 +179,11 @@ using XRootD.Session: CredentialRequest
         # stall on the strongest offer, and must not invent a credential for it.
         srv, port = start_auth_server(; sec="&P=ztn&P=sss&P=unix")
         missing_keytab = joinpath(mktempdir(), "absent.keytab")
-        conn, err = without_token() do
-            @test Session.discover_token() === nothing
-            auth_bringup(port; username="tester", keytab=missing_keytab)
+        conn, err = withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+            without_token() do
+                @test Session.discover_token() === nothing
+                auth_bringup(port; username="tester", keytab=missing_keytab)
+            end
         end
         @test err === nothing
         @test srv.creds[1][1] == "unix"
@@ -152,12 +198,14 @@ using XRootD.Session: CredentialRequest
         # the last moment at which the user can still fix it.
         srv, port = start_auth_server(; sec="&P=ztn&P=unix")
         asked = CredentialRequest[]
-        conn, err = without_token() do
-            auth_bringup(
-                port;
-                username="tester",
-                prompter=r -> (push!(asked, r); "typed.at.the.prompt"),
-            )
+        conn, err = withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+            without_token() do
+                auth_bringup(
+                    port;
+                    username="tester",
+                    prompter=r -> (push!(asked, r); "typed.at.the.prompt"),
+                )
+            end
         end
         @test err === nothing
         @test srv.creds[1][1] == "ztn"
@@ -176,8 +224,10 @@ using XRootD.Session: CredentialRequest
 
     @testset "a declined prompt falls through as though nothing was asked" begin
         srv, port = start_auth_server(; sec="&P=ztn&P=unix")
-        conn, err = without_token() do
-            auth_bringup(port; username="tester", prompter=_ -> nothing)
+        conn, err = withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+            without_token() do
+                auth_bringup(port; username="tester", prompter=_ -> nothing)
+            end
         end
         @test err === nothing
         @test srv.creds[1][1] == "unix"
@@ -193,15 +243,21 @@ using XRootD.Session: CredentialRequest
         record = r -> (push!(asked, r); nothing)
 
         srv, port = start_auth_server(; sec="&P=ztn&P=unix")
-        conn, err = without_token() do
-            auth_bringup(port; username="tester", token="from.the.caller", prompter=record)
+        conn, err = withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+            without_token() do
+                auth_bringup(
+                    port; username="tester", token="from.the.caller", prompter=record
+                )
+            end
         end
         @test err === nothing && isempty(asked)
         @test String(srv.creds[1][2]) == "ztn\0from.the.caller"
         close(conn)
 
         srv, port = start_auth_server(; sec="&P=ztn&P=unix")
-        conn, err = withenv("BEARER_TOKEN" => "from.the.environment") do
+        conn, err = withenv(
+            "BEARER_TOKEN" => "from.the.environment", "XRDC_ZTN_CLEARTEXT" => "1"
+        ) do
             auth_bringup(port; username="tester", prompter=record)
         end
         @test err === nothing && isempty(asked)
@@ -210,8 +266,10 @@ using XRootD.Session: CredentialRequest
 
         with_keytab(; id=7) do keytab
             srv, port = start_auth_server(; sec="&P=ztn&P=sss&P=unix")
-            conn, err = without_token() do
-                auth_bringup(port; username="tester", keytab=keytab, prompter=record)
+            conn, err = withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+                without_token() do
+                    auth_bringup(port; username="tester", keytab=keytab, prompter=record)
+                end
             end
             @test err === nothing && isempty(asked)
             @test srv.creds[1][1] == "sss"
@@ -257,17 +315,19 @@ using XRootD.Session: CredentialRequest
             previous = Session.prompt_credentials!(_ -> (asked += 1; "typed.token"))
             Session.forget_credentials!()
             try
-                without_token() do
-                    for _ in 1:2
-                        try
-                            push!(
-                                conns,
-                                Session.connect(
-                                    "127.0.0.1", port; x509=false, username="tester"
-                                ),
-                            )
-                        catch
-                            # a refused credential fails the bring-up, as it must
+                withenv("XRDC_ZTN_CLEARTEXT" => "1") do
+                    without_token() do
+                        for _ in 1:2
+                            try
+                                push!(
+                                    conns,
+                                    Session.connect(
+                                        "127.0.0.1", port; x509=false, username="tester"
+                                    ),
+                                )
+                            catch
+                                # a refused credential fails the bring-up, as it must
+                            end
                         end
                     end
                 end
@@ -305,6 +365,9 @@ using XRootD.Session: CredentialRequest
         msg = sprint(showerror, err)
         @test occursin("no supported authentication mechanism offered", msg)
         @test occursin("gsi", msg) && occursin("krb5", msg)
+        # ...and named as unimplemented, so gsi does not look like a protocol
+        # this client speaks that merely went wrong.
+        @test occursin("not implemented by this client", msg)
         @test isempty(srv.creds)
         @test isempty(srv.violations)
     end
@@ -314,7 +377,11 @@ using XRootD.Session: CredentialRequest
         # jobs to one mechanism has pinned this client too.
         @testset "it reorders" begin
             srv, port = start_auth_server(; sec="&P=ztn&P=unix")
-            conn, err = withenv("BEARER_TOKEN" => "tok", "XrdSecPROTOCOL" => "unix,ztn") do
+            conn, err = withenv(
+                "BEARER_TOKEN" => "tok",
+                "XRDC_ZTN_CLEARTEXT" => "1",
+                "XrdSecPROTOCOL" => "unix,ztn",
+            ) do
                 auth_bringup(port; username="tester")
             end
             @test err === nothing
@@ -433,7 +500,7 @@ using XRootD.Session: CredentialRequest
         # One kXR_auth round per connection: a client that answered a refusal
         # by working down the list would be doing the server's policy for it.
         srv, port = start_auth_server(; sec="&P=ztn&P=unix", auth_status=Wire.kXR_error)
-        _, err = withenv("BEARER_TOKEN" => "tok") do
+        _, err = withenv("BEARER_TOKEN" => "tok", "XRDC_ZTN_CLEARTEXT" => "1") do
             auth_bringup(port; username="tester")
         end
         @test err !== nothing
@@ -483,8 +550,9 @@ end
     end
 
     @testset "the signature covers the payload, not just the header" begin
-        # The server recomputes the HMAC over the request bytes it received;
-        # a path that did not go into the client's HMAC would not verify.
+        # The server recomputes the hash over the request bytes it received
+        # and re-encrypts it under the session key; a path that did not go
+        # into the client's hash would not verify.
         srv, port = start_auth_server(; signing_key=key)
         conn, err = auth_bringup(port; username="tester")
         @test err === nothing

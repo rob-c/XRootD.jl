@@ -207,8 +207,17 @@ const CLONE_ITEM_LEN = 32
 const CLONE_MAXITEMS = 1024  # maxClonesz
 
 # ---- kXR_sigver (flags.h) ----
-const kXR_SHA256_sig = 0x01  # HMAC algorithm is HMAC-SHA256
-const kXR_nodata_sig = 0x01  # payload NOT included in the HMAC
+const kXR_SHA256_sig = 0x01  # signature hash is SHA-256 (secver 0)
+const kXR_nodata_sig = 0x01  # payload NOT included in the hash
+
+# ---- kXR_protocol security-requirements trailer (XProtocol.hh) ----
+# secopt bits advertised in the ServerResponseReqs_Protocol trailer.
+const kXR_secOData = 0x01    # sign data payloads too (write/pgwrite cover data)
+const kXR_secOFrce = 0x02    # sign even when the connection is encrypted
+# Per-request overrides carried in the trailer's secvec entries.
+const kXR_signIgnore = 0x00  # never sign this request
+const kXR_signLikely = 0x01  # sign per the advertised security level
+const kXR_signNeeded = 0x02  # always sign this request
 
 # ---- kXR_fattr subcodes + options (opcodes.h / flags.h) ----
 const kXR_fattrDel  = 0x00

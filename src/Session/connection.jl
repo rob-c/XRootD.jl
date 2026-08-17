@@ -45,6 +45,8 @@ mutable struct Connection
     reader::Union{Task,Nothing}
     closed::Bool
     sec_level::Int                          # server security level (0 = no signing)
+    sec_opts::UInt8                          # kXR_secOData/kXR_secOFrce from the trailer
+    sec_overrides::Dict{UInt16,UInt8}        # secvec: opcode → sign requirement
     signing_key::Union{Vector{UInt8},Nothing}
     sig_seqno::UInt64
     last_activity::Float64                   # time() of the last frame sent
@@ -52,6 +54,7 @@ mutable struct Connection
     stall_deadline_ms::Int                   # whole-operation cutoff (0 = disabled)
     datapaths::Dict{UInt8,DataPath}          # kXR_bind links, by path id
     routed::Dict{UInt16,UInt8}               # in-flight streamid → path id
+    substreams_rw::Union{Bool,Nothing}       # paths carry whole frames (nothing = unprobed)
 end
 
 """
@@ -179,6 +182,28 @@ function Base.showerror(io::IO, e::TLSHandshakeFailed)
     return nothing
 end
 
+"""
+    TLSRequiredByServer(host, port)
+
+A `kXR_login` the server refused with `kXR_TLSRequired`: it will only take
+logins on an encrypted connection, and this one asked in the clear. Its own
+exception type because — unlike every other login refusal — the client can
+fix this one by itself: [`connect`](@ref) catches it and reconnects with TLS.
+"""
+struct TLSRequiredByServer <: Exception
+    host::String
+    port::Int
+end
+
+function Base.showerror(io::IO, e::TLSRequiredByServer)
+    print(
+        io,
+        "$(e.host):$(e.port) refused the login: the server requires TLS " *
+        "(kXR_TLSRequired)",
+    )
+    return nothing
+end
+
 "The OpenSSL wording for a peer that asked for a client certificate we did not have."
 function wants_client_cert(cause)
     msg = sprint(showerror, cause)
@@ -270,6 +295,26 @@ function connect(
             close(sock)
         catch
             # already gone, which is the state we wanted
+        end
+        # A login refused for arriving in the clear is fixed by arriving
+        # encrypted. `want_tls` already true means the refusal survived a TLS
+        # connection — something else is wrong, and retrying would recur.
+        if err isa TLSRequiredByServer && !want_tls
+            return connect(
+                host,
+                port;
+                username,
+                want_tls=true,
+                insecure_tls,
+                token,
+                keytab,
+                cert,
+                key,
+                cafile,
+                x509,
+                keepalive_s,
+                connect_timeout,
+            )
         end
         # A handshake the peer refused for want of a client certificate is the
         # one failure a user can still fix from here. `cert` being unset is
@@ -598,11 +643,20 @@ function bring_up(
     login = guard_bringup(sock, host, port, connect_timeout, "the login reply") do
         write(sock, Wire.encode(Wire.LoginRequest(username), UInt16(2)))
         l_hdr, l_body = read_frame(sock)
+        if l_hdr.status == Wire.kXR_error && length(l_body) >= 4
+            # kXR_TLSRequired is the one refusal with a remedy the client
+            # holds: reconnect encrypted. `connect` catches this and does.
+            errnum = Wire.decode_error(l_body).errnum
+            (errnum & 0xffff) == Wire.kXR_TLSRequired &&
+                throw(TLSRequiredByServer(String(host), Int(port)))
+        end
         l_hdr.status == Wire.kXR_ok || bringup_error("kXR_login", l_hdr)
         return Wire.decode_login(l_body)
     end
 
-    if !isempty(login.sec)
+    auth = if isempty(login.sec)
+        nothing
+    else
         authenticate(
             sock, username, login.sec; token, keytab, host, port, timeout_s=connect_timeout
         )
@@ -622,14 +676,21 @@ function bring_up(
         UInt16(4),   # 1..3 were used during bring-up
         nothing,
         false,
-        0,           # sec_level: no signing until negotiated
-        nothing,     # signing_key
+        # The signing contract the kXR_protocol trailer advertised. It only
+        # bites when the mechanism that won left a session key behind: a
+        # server demanding signatures from a key-less session is refused per
+        # request by the server, not guessed at here.
+        Int(proto.seclvl),
+        proto.secopt,
+        Dict{UInt16,UInt8}(proto.secvec),
+        auth === nothing ? nothing : auth.key,
         UInt64(0),   # sig_seqno
         time(),      # last_activity
         nothing,     # keepalive timer
         stall_deadline_ms(),
         Dict{UInt8,DataPath}(),
         Dict{UInt16,UInt8}(),
+        nothing,     # substreams_rw: not yet probed
     )
     conn.reader = errormonitor(Threads.@spawn reader_loop(conn))
     keepalive_s > 0 && start_keepalive!(conn, Float64(keepalive_s))
@@ -760,7 +821,36 @@ function bind_data_path!(
     # Started only once the path is registered: a frame that arrives the
     # instant the socket is readable must find a table to be routed through.
     path.reader[] = errormonitor(Threads.@spawn data_path_loop(conn, path))
+    probe_substreams!(conn)
     return pathid
+end
+
+"""
+    probe_substreams!(conn)
+
+Ask the server — once per session, after the first successful bind — whether
+its bound paths speak whole request frames (`kXR_Qconfig brix.substreams`,
+answered `…=rw` by a BriX server built that way). A stock server echoes an
+unknown key back verbatim, which reads as "no", and any error reads as "no"
+too: the split framing is the protocol default, so only an explicit yes moves
+traffic off it. [`transmit`](@ref) consults the verdict on every routed
+request.
+"""
+function probe_substreams!(conn::Connection)
+    conn.substreams_rw === nothing || return nothing
+    conn.substreams_rw = false
+    try
+        hdr, body = roundtrip(
+            conn, Wire.QueryRequest(Wire.kXR_Qconfig, "brix.substreams")
+        )
+        if hdr.status == Wire.kXR_ok
+            conn.substreams_rw = occursin("=rw", String(copy(body)))
+        end
+    catch
+        # A probe that failed outright changes nothing: the default framing
+        # was going to be used anyway, and the bind that preceded it stands.
+    end
+    return nothing
 end
 
 "The path ids bound to `conn`, in no particular order."
@@ -1097,7 +1187,10 @@ bounded separately by [`max_wait_ms`](@ref).
 
 A request naming a bound data path ([`bind_data_path!`](@ref)) puts its header
 on the control link and its bulk bytes on that path; the reply arrives on
-whichever link the server chooses and is matched by streamid either way.
+whichever link the server chooses and is matched by streamid either way. On a
+session whose server answered the substreams probe ([`probe_substreams!`](@ref))
+the whole frame — header included, `pathid` zeroed — goes down the path
+instead, which spares the control link even the headers of a bulk transfer.
 """
 function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
     conn.closed && return synthetic_error(0x0000, "connection already closed")
@@ -1112,7 +1205,11 @@ function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
         return synthetic_error(0x0000, "no data path $pid is bound to this session")
     end
     sid, ch = register!(conn)
-    frame = Wire.encode(req, sid)
+    # Whole-frame mode re-encodes without the pathid: the request IS on the
+    # path it named, and a pathid in a frame already riding that path would
+    # ask the server to route the data a second time.
+    whole = path !== nothing && conn.substreams_rw === true
+    frame = Wire.encode(whole ? Wire.without_pathid(req) : req, sid)
     acc = UInt8[]
     cap = Int(maxbytes)
     stall = nothing
@@ -1123,7 +1220,7 @@ function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
         return conn.routed[sid] = pid
     end
     try
-        transmit(conn, frame, req, path)
+        transmit(conn, frame, req, path; whole)
         stall = arm_stall(conn, sid, ch)
         while true
             hdr, body = take!(ch)
@@ -1150,7 +1247,7 @@ function roundtrip(conn::Connection, req::Wire.Request; maxbytes::Integer=0)
                     "operation parked for more than the $(waited_ms) ms kXR_wait budget",
                 )
                 sleep(secs)
-                transmit(conn, frame, req, path)
+                transmit(conn, frame, req, path; whole)
                 stall === nothing || close(stall)
                 stall = arm_stall(conn, sid, ch)
             elseif hdr.status == Wire.kXR_waitresp
@@ -1204,17 +1301,31 @@ end
 """
 Put one request on the wire: the signature prefix if the session signs, the
 frame itself on the control link, and — for a request bound to a data path —
-its [`Wire.path_data`](@ref) on that path's socket.
+its [`Wire.path_data`](@ref) on that path's socket. With `whole` set (a
+session whose server answered the substreams probe) the signature and frame
+go down the path instead and the control link carries nothing at all.
 
 The two writes take two different locks because they are two different links;
 the path's own lock is what keeps concurrent writers on one path from
 interleaving their data, which the server, reading `dlen` bytes in order,
 would have no way to untangle.
 """
-function transmit(conn::Connection, frame::Vector{UInt8}, req::Wire.Request, path)
+function transmit(
+    conn::Connection, frame::Vector{UInt8}, req::Wire.Request, path; whole::Bool=false
+)
     # High-security servers require a kXR_sigver prefix on mutating ops;
     # it must share the write lock so it stays adjacent to its request.
     sig = sign_frame(conn, frame)
+    if whole
+        guard_send(conn, path.sock) do
+            return lock(path.wlock) do
+                sig === nothing || write(path.sock, sig)
+                return write(path.sock, frame)
+            end
+        end
+        conn.last_activity = time()
+        return nothing
+    end
     if sig === nothing
         send(conn, frame)
     else

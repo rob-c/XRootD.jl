@@ -11,7 +11,7 @@
 # client's encoders.
 
 using Sockets
-using SHA: hmac_sha256
+using SHA: sha256
 using XRootD: Wire, Session
 
 const AUTH_NotAuthorized = 3010   # XErrorCode kXR_NotAuthorized
@@ -30,8 +30,8 @@ const AUTH_SIGNED_OPS = Set{UInt16}([
     Wire.kXR_mv,
     Wire.kXR_chmod,
     Wire.kXR_fattr,
-    Wire.kXR_set,
-    Wire.kXR_prepare,
+    Wire.kXR_chkpoint,
+    Wire.kXR_clone,
 ])
 
 """
@@ -71,8 +71,10 @@ end
 
 """
 Check the `kXR_sigver` prefix `sig` against the request `frame`/`payload` it
-covers, the way a server does: recompute the HMAC from the key and the bytes
-that arrived, and require the sequence number to advance.
+covers, the way a server does: recompute the SHA-256 over the bytes that
+arrived, encrypt it under the session key (the secver-0 cipher is
+deterministic, so re-encrypting and comparing is the verification), and
+require the sequence number to advance.
 """
 function auth_check_sigver(s::AuthServer, sig, frame, payload)
     key = something(s.signing_key)
@@ -81,9 +83,14 @@ function auth_check_sigver(s::AuthServer, sig, frame, payload)
     expect == reqid || flag!(s, "kXR_sigver: covers $(expect), next request is $(reqid)")
     sig[7] == 0x00 || flag!(s, "kXR_sigver: version byte is $(sig[7]), not 0")
     sig[17] == Wire.kXR_SHA256_sig ||
-        flag!(s, "kXR_sigver: crypto byte is $(sig[17]), not HMAC-SHA256")
+        flag!(s, "kXR_sigver: crypto byte is $(sig[17]), not SHA-256")
     Wire.get_u16(sig, 1) == Wire.get_u16(frame, 1) ||
         flag!(s, "kXR_sigver: streamid differs from the request it signs")
+    nodata = (sig[8] & Wire.kXR_nodata_sig) != 0x00
+    nodata &&
+        reqid != Wire.kXR_write &&
+        reqid != Wire.kXR_pgwrite &&
+        flag!(s, "kXR_sigver: nodata on $(Wire.request_name(reqid)), not a data carrier")
 
     seqno = Wire.get_u64(sig, 9)
     isempty(s.seqnos) ||
@@ -91,11 +98,12 @@ function auth_check_sigver(s::AuthServer, sig, frame, payload)
         flag!(s, "kXR_sigver: seqno $(seqno) did not advance past $(s.seqnos[end])")
     push!(s.seqnos, seqno)
 
-    mac = sig[25:end]
-    length(mac) == 32 || flag!(s, "kXR_sigver: hmac is $(length(mac)) bytes, not 32")
+    blob = sig[25:end]
+    length(blob) == 36 || flag!(s, "kXR_sigver: signature is $(length(blob)) bytes, not 36")
     seqbytes = UInt8[(seqno >> (8 * (7 - i))) % UInt8 for i in 0:7]
-    msg = vcat(seqbytes, frame[1:24], payload)
-    hmac_sha256(key, msg) == mac || flag!(s, "kXR_sigver: hmac does not verify")
+    msg = nodata ? vcat(seqbytes, frame[1:24]) : vcat(seqbytes, frame[1:24], payload)
+    Session.bf32_encrypt(key, sha256(msg)) == blob ||
+        flag!(s, "kXR_sigver: signature does not verify")
     push!(s.signed, reqid)
     return nothing
 end

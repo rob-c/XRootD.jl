@@ -773,19 +773,20 @@ end
 # ---- request signing (kXR_sigver; libxrdc sigver.c) ----
 
 """
-    SigverRequest(expectrid::UInt16, seqno::UInt64, hmac::Vector{UInt8};
+    SigverRequest(expectrid::UInt16, seqno::UInt64, sig::Vector{UInt8};
                   crypto::UInt8 = kXR_SHA256_sig, nodata::Bool = false)
 
 `kXR_sigver` — a signing PREFIX sent before a request that a high-security
 server (`sec_level ≥ 2`) requires to be signed. `expectrid` is the next
 request's opcode, `seqno` a per-connection monotonic counter, and the
-payload the 32-byte HMAC-SHA256 over `seqno_be(8) || request_hdr(24) ||
-payload`. Conformant servers send no reply on success.
+payload the session-cipher encryption of the SHA-256 over
+`seqno_be(8) || request_hdr(24) || payload` (secver 0; the payload is
+skipped when `nodata`). Conformant servers send no reply on success.
 """
 struct SigverRequest <: Request
     expectrid::UInt16
     seqno::UInt64
-    hmac::Vector{UInt8}
+    sig::Vector{UInt8}
     crypto::UInt8
     nodata::Bool
 end
@@ -793,11 +794,11 @@ end
 function SigverRequest(
     expectrid::UInt16,
     seqno::UInt64,
-    hmac::Vector{UInt8};
+    sig::Vector{UInt8};
     crypto::UInt8=kXR_SHA256_sig,
     nodata::Bool=false,
 )
-    return SigverRequest(expectrid, seqno, hmac, crypto, nodata)
+    return SigverRequest(expectrid, seqno, sig, crypto, nodata)
 end
 
 requestid(::SigverRequest) = kXR_sigver
@@ -811,7 +812,7 @@ function body!(frame::Vector{UInt8}, r::SigverRequest)
     return frame
 end
 
-payload(r::SigverRequest) = r.hmac
+payload(r::SigverRequest) = r.sig
 
 # ---- extended filesystem operations ----
 

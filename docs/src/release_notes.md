@@ -92,6 +92,18 @@ XrdRust) carry and 0.3.0 did not:
   never issued, and a data path that dies alone fails only the requests it
   was carrying.
 
+- Whole frames on a bound path, for the servers that take them: at a
+  session's first bind the client asks `kXR_Qconfig` for `brix.substreams`,
+  and an answer of `=rw` — BriX's spelling — switches the session to sending
+  complete request frames on the path, data included, instead of the split
+  header-on-control, data-on-path framing. A stock server echoes the unknown
+  key back, which reads as "no" and costs one round trip once.
+
+- A path-routed `kXR_write` answered `kXR_Unsupported` — what a proxy that
+  binds paths but will not take data on them says — is retried inline on the
+  control link and the file latches: later writes go inline at once rather
+  than paying the refusal again, and reads keep the path.
+
 - The S3 backend reaches the rest of its own protocol: `storage_list` pages a
   key prefix through `ListObjectsV2`, `storage_copy` is an `x-amz-copy-source`
   the endpoint executes for itself, `storage_move` is that copy plus a delete
@@ -108,6 +120,18 @@ XrdRust) carry and 0.3.0 did not:
   `kXR_mv` carries no "replace" flag, so an occupied destination is refused
   outright and cleared first when `overwrite=true`, rather than being left to
   whichever way the server happens to rule.
+
+- A whole-file write over xroot — `storage_write`, `storage_open(url, "w")`
+  and the third-party-copy destination — opens
+  `Update | Delete | MakePath` instead of write-only: `kXR_open_wrto` is a
+  mode some servers refuse to combine with the read-back a verifying caller
+  does, and `MakePath` spares a first upload pre-creating the directory it
+  lands in.
+
+- A `File` keeps its recorded size truthful under its own hand: a write past
+  the end grows it and `truncate` re-declares it, so `eof` answers for the
+  file as it is now rather than as it was at open. Reads were never affected
+  — they have always said how much they want.
 
 Streams — a storage object where a Julia `IO` is expected, in both directions:
 
@@ -175,6 +199,37 @@ Credentials:
   message would print a bearer token, an sss session key or an AWS secret key
   verbatim.
 
+Security on the xroot control stream:
+
+- Requests are signed when the login's security trailer asks for it
+  (secver 0): each covered request is preceded by a `kXR_sigver` frame
+  carrying an SHA-256 digest of sequence number, request header and payload,
+  encrypted with the session key `sss` agreed — the same `bf32` construction
+  the C++ verifier recomputes. The server's per-opcode advice decides first;
+  where it only says "likely", level 2 signs the modifying opcodes — open,
+  the writes, truncate and the namespace mutations — and anything above
+  signs everything. A write's payload is hashed only when the server asked
+  for data coverage (`kXR_secOData`); otherwise the signature covers the
+  header and the frame says so.
+- That trailer is found where BriX puts it as well as where the spec does:
+  BriX prefixes the `'S'` record with a security-methods block, which used to
+  decode as "no signing required" — precisely against the server that asks
+  for signing. A trailer of any other shape still reads as no requirements,
+  which is how XrdCl reads one it does not recognise.
+- A bearer token is no longer volunteered over a cleartext `root://`
+  connection: `ztn` is skipped there in favour of whatever else both ends
+  speak, the failure message says why when nothing else would do, and
+  `XRDC_ZTN_CLEARTEXT=1` sends it anyway on a link trusted some other way.
+- A login refused with `kXR_TLSRequired` is answered by reconnecting over
+  TLS rather than reported as an error — and a server that demands TLS while
+  not offering it is reported as exactly that, instead of as a retry loop.
+- Mechanisms are tried in the server's advertised order — a server states
+  its protocols in the order its authorization honours them — rather than by
+  a ranking of this client's own; `XrdSecPROTOCOL` still overrides both the
+  order and the set. A mechanism the server offers and this client does not
+  implement is named as not implemented rather than folded into "nothing
+  usable".
+
 Bad networks — the failures a wide-area link produces between a job and the
 storage it was given, rather than the ones a server reports:
 
@@ -241,7 +296,9 @@ storage it was given, rather than the ones a server reports:
   fails with `short read: N of M bytes`. This is the failure `verify=true`
   cannot catch: a transfer that stops halfway leaves a valid short object
   whose checksum both ends agree on. An endpoint that will not declare a size
-  is not held to one.
+  is not held to one. `verify=true` now also compares the destination's
+  read-back size against what was sent, before the checksum: a store that
+  truncated or padded says so in bytes rather than as a digest mismatch.
 
 Environment:
 

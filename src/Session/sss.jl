@@ -91,6 +91,25 @@ function read_keytab(path::AbstractString)
 end
 
 """
+    bf32_encrypt(key_bytes, plain) -> Vector{UInt8}
+
+XrdCryptoLite's `bf32` transform, the cipher SSS credentials and secver-0
+signatures share: append the IEEE-CRC32 of `plain` big-endian, then
+Blowfish-CFB64 the whole thing with a zero IV. The output is
+`length(plain) + 4` bytes and — the zero IV — deterministic, which is what
+lets a verifier check a signature by re-encrypting rather than decrypting.
+"""
+function bf32_encrypt(key_bytes::AbstractVector{UInt8}, plain::AbstractVector{UInt8})
+    crc = crc32_ieee(plain)
+    buf = vcat(
+        Vector{UInt8}(plain),
+        UInt8[(crc >> 24) % UInt8, (crc >> 16) % UInt8, (crc >> 8) % UInt8, crc % UInt8],
+    )
+    ctx = Blowfish.Context(key_bytes)
+    return Blowfish.cfb64_encrypt(ctx, zeros(UInt8, 8), buf)
+end
+
+"""
     build_sss_credential(key::SSSKey, username; nonce=rand, gen_time=now) -> Vector{UInt8}
 
 Mint an SSS `kXR_auth` credential blob from `key`, identical to the shared
@@ -122,15 +141,7 @@ function build_sss_credential(
     append!(tlv, ub[1:(ulen - 1)])
     push!(tlv, 0x00)
 
-    body = vcat(clear, tlv)
-    crc = crc32_ieee(body)
-    plain = vcat(
-        body,
-        UInt8[(crc >> 24) % UInt8, (crc >> 16) % UInt8, (crc >> 8) % UInt8, crc % UInt8],
-    )
-
-    ctx = Blowfish.Context(key.key)
-    cipher = Blowfish.cfb64_encrypt(ctx, zeros(UInt8, 8), plain)
+    cipher = bf32_encrypt(key.key, vcat(clear, tlv))
 
     header = zeros(UInt8, SSS_HDR_LEN)
     header[1] = UInt8('s')
@@ -149,12 +160,16 @@ function build_sss_credential(
 end
 
 """
-    sss_credential(; keytab=nothing, username=local_user()) -> Union{Vector{UInt8},Nothing}
+    sss_material(; keytab=nothing, username=local_user())
+        -> Union{NamedTuple,Nothing}
 
-Build an SSS credential from the first usable key in `keytab` (default
-[`default_keytab_path`](@ref)); `nothing` when no readable key exists.
+The credential AND the key it was minted from, as `(; cred, key::SSSKey)` —
+`nothing` when no readable key exists. The key outlives the login exchange:
+it is the session cipher secver-0 request signing encrypts with, so a caller
+who only wanted the blob takes `.cred` and a caller arming signing keeps
+`.key` too.
 """
-function sss_credential(;
+function sss_material(;
     keytab::Union{AbstractString,Nothing}=nothing, username::AbstractString=local_user()
 )
     path = keytab === nothing ? default_keytab_path() : keytab
@@ -165,7 +180,20 @@ function sss_credential(;
         return nothing
     end
     isempty(keys) && return nothing
-    return build_sss_credential(keys[1], username)
+    return (; cred=build_sss_credential(keys[1], username), key=keys[1])
+end
+
+"""
+    sss_credential(; keytab=nothing, username=local_user()) -> Union{Vector{UInt8},Nothing}
+
+Build an SSS credential from the first usable key in `keytab` (default
+[`default_keytab_path`](@ref)); `nothing` when no readable key exists.
+"""
+function sss_credential(;
+    keytab::Union{AbstractString,Nothing}=nothing, username::AbstractString=local_user()
+)
+    m = sss_material(; keytab, username)
+    return m === nothing ? nothing : m.cred
 end
 
 function local_user()

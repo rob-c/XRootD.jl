@@ -170,6 +170,10 @@ A token is a bearer credential: anyone who sees it can use it. A token that
 was *discovered* is therefore dropped rather than sent over cleartext
 `http://` (with a warning), and one passed *explicitly* raises an
 `ArgumentError` unless `allow_cleartext_token=true` says the risk is
+understood. The same rule holds for `ztn` on the xroot side: the token
+travels only inside TLS, so on a cleartext `root://` connection the
+mechanism is skipped in favour of whatever else both ends speak — reconnect
+with `roots://`, or set `XRDC_ZTN_CLEARTEXT=1` to say the risk is
 understood. Legacy GSI (the pre-TLS X.509 handshake on the xroot control
 stream) is not implemented; X.509 credentials authenticate through TLS, which
 is what current servers expect.
@@ -195,6 +199,7 @@ second configuration.
 | `X509_CERT_FILE`, `SSL_CERT_FILE` | CA bundle to trust, on top of the system store. |
 | `X509_USER_PROXY`, `X509_USER_CERT`, `X509_USER_KEY`, `X509_CERT_DIR` | X.509 credential and hashed CA directory, as in the table above. |
 | `BEARER_TOKEN`, `BEARER_TOKEN_FILE` | WLCG bearer token, as in the table above. |
+| `XRDC_ZTN_CLEARTEXT=1` | Offer a `ztn` bearer token over a cleartext `root://` connection. By default the token is held back there and presented only inside TLS. |
 | `XRD_PROMPT=0` | Never ask for a missing credential, even under a terminal (`XRDC_NO_PROMPT=1` does the same). |
 
 The client's own knobs govern what it does when the network between you and

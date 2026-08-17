@@ -1,13 +1,15 @@
 # Authentication mechanisms. After kXR_login the server may return a
 # security trailer ("&P=ztn,...&P=sss,...&P=unix"); `authenticate` parses the
-# offered protocols and tries them best-first (ztn > sss > unix), sending the
-# selected credential in one kXR_auth round. Ground truth: libxrdc
+# offered protocols and tries them in the server's order (filtered to what
+# this client speaks; $XrdSecPROTOCOL overrides), sending the selected
+# credential in one kXR_auth round. Ground truth: libxrdc
 # sec/sec_{token,sss,unix}.c.
 
 """
-Ordered list of protocol names in a `&P=<proto>[,args]` security trailer,
-most-preferred first is NOT implied by wire order — we impose our own
-preference in [`authenticate`](@ref).
+Ordered list of protocol names in a `&P=<proto>[,args]` security trailer.
+Wire order IS the server's preference order — the trailer is built from its
+`sec.protocol` directives first to last — and [`authenticate`](@ref) honours
+it unless the caller (or `\$XrdSecPROTOCOL`) imposes their own.
 """
 function parse_sec_protocols(sec::AbstractString)
     protos = String[]
@@ -50,15 +52,27 @@ end
 
 """
     authenticate(sock, username, sec; token=nothing, keytab=nothing,
-                 host="", port=0, order=auth_order(),
+                 host="", port=0, order=env_auth_order(),
                  timeout_s=connection_window_s())
+        -> Union{NamedTuple,Nothing}
 
 Complete authentication after login. Parses the server's security trailer
-`sec` and tries the mechanisms the server offers in `order`, best first:
-`ztn` (when a token is found), then `sss` (when a keytab key is found), then
-`unix`. `\$XrdSecPROTOCOL` reorders and restricts that list
-([`auth_order`](@ref)) — a mechanism it leaves out is not tried even when the
-server offers it. Errors if nothing offered can be satisfied.
+`sec` and tries the offered mechanisms in the *server's* order, filtered to
+the ones this client implements (`ztn`, `sss`, `unix`): the server listed
+them in the order its authorization actually honours them. An explicit
+`order` — or `\$XrdSecPROTOCOL` ([`env_auth_order`](@ref)) — takes over both
+the order and the restriction: a mechanism it leaves out is not tried even
+when the server offers it. Errors if nothing offered can be satisfied.
+
+Returns `(; mech, key)` naming the mechanism that won and the session key it
+established — the raw sss key bytes, the material request signing encrypts
+with — or `nothing` for the mechanisms (`ztn`, `unix`) that leave no key
+behind, and for a trailer that asked for nothing.
+
+A bearer token is a reusable secret, so `ztn` is only tried when the
+connection is encrypted: volunteering it over cleartext hands it to every
+middlebox on the path. `XRDC_ZTN_CLEARTEXT=1` overrides, for a test bench
+that is its own network.
 
 A credential the server asks for and discovery cannot find is asked for
 ([`ask_credential`](@ref)) at the point where its absence is about to cost
@@ -80,26 +94,41 @@ function authenticate(
     keytab::Union{AbstractString,Nothing}=nothing,
     host::AbstractString="",
     port::Integer=0,
-    order::AbstractVector{<:AbstractString}=auth_order(),
+    order::Union{AbstractVector{<:AbstractString},Nothing}=env_auth_order(),
     timeout_s::Real=connection_window_s(),
 )
     offered = parse_sec_protocols(sec)
     isempty(offered) && return nothing   # trailer with no &P= — nothing to do
 
-    # What the server offers *and* the caller allows, in the caller's order of
-    # preference. A mechanism ruled out here is invisible to everything below,
-    # including the prompts: asking for a keytab that `$XrdSecPROTOCOL` has
-    # already excluded would be asking for something we would not send.
-    usable = [String(m) for m in order if m in offered]
+    # Which mechanisms may be tried, in whose order. With no order imposed the
+    # server's stands, filtered to what this client speaks; an imposed order
+    # replaces it outright. A mechanism ruled out here is invisible to
+    # everything below, including the prompts: asking for a keytab that
+    # `$XrdSecPROTOCOL` has already excluded would be asking for something we
+    # would not send.
+    usable = if order === nothing
+        [String(m) for m in offered if m in DEFAULT_AUTH_ORDER]
+    else
+        [String(m) for m in order if m in offered]
+    end
     isempty(usable) && return error(mechanism_error(offered, order))
 
-    sss_cred = "sss" in usable ? sss_credential(; keytab) : nothing
+    sss = "sss" in usable ? sss_material(; keytab) : nothing
+    ztn_allowed = sock isa OpenSSL.SSLStream || env_flag("XRDC_ZTN_CLEARTEXT")
+    ztn_blocked = false
 
     for mech in usable
         if mech == "ztn"
+            if !ztn_allowed
+                # Skipped, not failed: the next mechanism may well work, and
+                # the prompt is skipped too — asking a person for a token this
+                # connection would refuse to send helps nobody.
+                ztn_blocked = true
+                continue
+            end
             jwt = discover_token(; explicit=token)
             prompted = false
-            if jwt === nothing && token === nothing && sss_cred === nothing
+            if jwt === nothing && token === nothing && sss === nothing
                 jwt = prompt_token(host, port)
                 prompted = jwt !== nothing
             end
@@ -107,7 +136,8 @@ function authenticate(
             # ztn payload repeats the tag: "ztn\0" then the JWT (sec_token.c).
             cred = vcat(Vector{UInt8}(codeunits("ztn\0")), Vector{UInt8}(codeunits(jwt)))
             try
-                return send_auth(sock, "ztn", cred; host, port, timeout_s)
+                send_auth(sock, "ztn", cred; host, port, timeout_s)
+                return (; mech="ztn", key=nothing)
             catch
                 # A token that was typed and then rejected is most likely stale
                 # or mispasted, so it is forgotten and the next connection asks
@@ -116,35 +146,52 @@ function authenticate(
                 rethrow()
             end
         elseif mech == "sss"
-            if sss_cred === nothing && keytab === nothing && !("unix" in usable)
-                sss_cred = prompt_keytab(host, port)
+            if sss === nothing && keytab === nothing && !("unix" in usable)
+                sss = prompt_keytab(host, port)
             end
-            sss_cred === nothing && continue
-            return send_auth(sock, "sss", sss_cred; host, port, timeout_s)
+            sss === nothing && continue
+            send_auth(sock, "sss", sss.cred; host, port, timeout_s)
+            return (; mech="sss", key=sss.key.key)
         elseif mech == "unix"
             cred = vcat(
                 Vector{UInt8}(codeunits("unix\0")), Vector{UInt8}(codeunits(username))
             )
-            return send_auth(sock, "unix", cred; host, port, timeout_s)
+            send_auth(sock, "unix", cred; host, port, timeout_s)
+            return (; mech="unix", key=nothing)
         end
         # Anything else is a mechanism this client does not implement (`gsi`,
         # `krb5`): it stays in the list so the error can name it, but there is
         # nothing to send for it.
     end
 
-    return error(mechanism_error(offered, order))
+    return error(mechanism_error(offered, order; ztn_blocked))
 end
 
 """
 Why authentication got nowhere. The server's list is always named; the
 client's is named too when it was narrowed, because `\$XrdSecPROTOCOL`
 excluding the one mechanism both sides had looks exactly like a server that
-offered nothing usable.
+offered nothing usable. Mechanisms the server offered that this client does
+not implement are called out — `gsi` looks supported until someone says it
+is not — and so is a token withheld for want of encryption, which otherwise
+looks exactly like having no token.
 """
-function mechanism_error(offered, order)
+function mechanism_error(offered, order; ztn_blocked::Bool=false)
     msg = "no supported authentication mechanism offered (server: $(join(offered, ", ")))"
-    Set(order) == Set(DEFAULT_AUTH_ORDER) && return msg
-    return "$msg (client: $(join(order, ", ")))"
+    if order !== nothing && Set(order) != Set(DEFAULT_AUTH_ORDER)
+        msg *= " (client: $(join(order, ", ")))"
+    end
+    missing_mechs = unique([String(m) for m in offered if !(m in DEFAULT_AUTH_ORDER)])
+    if !isempty(missing_mechs)
+        verb = length(missing_mechs) == 1 ? "is" : "are"
+        msg *= "; $(join(missing_mechs, ", ")) $verb not implemented by this client"
+    end
+    if ztn_blocked
+        msg *=
+            "; a ztn bearer token is only sent over TLS — reconnect with " *
+            "roots:// (or set XRDC_ZTN_CLEARTEXT=1 to send it in the clear)"
+    end
+    return msg
 end
 
 "Ask for the bearer token the server wants, naming everywhere we looked for one."
@@ -160,7 +207,7 @@ function prompt_token(host::AbstractString, port::Integer)
     )
 end
 
-"Ask for an sss keytab, and turn the answer into a credential."
+"Ask for an sss keytab, and turn the answer into credential material."
 function prompt_keytab(host::AbstractString, port::Integer)
     answer = ask_credential(
         CredentialRequest(
@@ -172,7 +219,7 @@ function prompt_keytab(host::AbstractString, port::Integer)
         ),
     )
     answer === nothing && return nothing
-    return sss_credential(; keytab=answer)
+    return sss_material(; keytab=answer)
 end
 
 "How an endpoint is named in a prompt: `root://host:port`, or just `the server`."

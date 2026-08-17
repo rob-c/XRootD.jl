@@ -116,6 +116,80 @@ using XRootD.XrdCl: bind_data_path!
         @test isempty(srv.violations)
     end
 
+    @testset "a server that answers the substreams probe gets whole frames" begin
+        # BriX's whole-frame mode: a server that answers the kXR_Qconfig
+        # "brix.substreams" probe with "=rw" takes complete request frames on
+        # the bound path — header, data and all — instead of the split
+        # header-on-control, data-on-path framing. A stock server just echoes
+        # the unknown key back, which reads as "no".
+        conf_reset!(srv)
+        f = conf_file(port, OpenFlags.Read)
+        st, _ = bind_data_path!(f)
+        @test isOK(st)
+        @test Wire.kXR_query in srv.ops     # the probe was asked at bind time
+        @test f.conn.substreams_rw === false
+        @test isempty(srv.path_ops)
+        close(f)
+        @test isempty(srv.violations)
+
+        conf_reset!(srv)
+        srv.data = copy(CONF_CONTENT)
+        srv.substreams_rw = true
+        f = conf_file(port, OpenFlags.Update)
+        st, _ = bind_data_path!(f)
+        @test isOK(st)
+        @test f.conn.substreams_rw === true
+
+        st, buf = read(f, 512, 0)
+        @test isOK(st) && buf == CONF_CONTENT[1:512]
+        payload = Vector{UInt8}(codeunits("whole-frame payload"))
+        st, _ = write(f, payload, length(payload), 200)
+        @test isOK(st)
+        @test srv.data[201:(200 + length(payload))] == payload
+        # Both rode the path whole — the server flags a whole-frame request
+        # that still names a path id, so an empty violation list means the
+        # re-encoding dropped it as it must.
+        @test srv.path_ops == [Wire.kXR_read, Wire.kXR_write]
+
+        # The control link still carries everything that is not bulk data.
+        st, si = stat(f)
+        @test isOK(st) && si.size == length(srv.data)
+        @test !(Wire.kXR_stat in srv.path_ops)
+
+        close(f)
+        @test isempty(srv.violations)
+    end
+
+    @testset "a refused routed write latches back to the control link" begin
+        # The case BriX documents: a proxy binds paths happily but answers a
+        # path-routed kXR_write with kXR_Unsupported. The client retries that
+        # write inline and stops routing writes for the file — reads keep the
+        # path, and no further refusal round-trips are paid.
+        conf_reset!(srv)
+        srv.data = copy(CONF_CONTENT)
+        srv.refuse_routed_write = true
+        f = conf_file(port, OpenFlags.Update)
+        st, _ = bind_data_path!(f)
+        @test isOK(st)
+
+        payload = Vector{UInt8}(codeunits("latched payload"))
+        st, _ = write(f, payload, length(payload), 100)
+        @test isOK(st)
+        @test srv.routed_write_refusals == 1
+        @test srv.data[101:(100 + length(payload))] == payload
+
+        st, _ = write(f, payload, length(payload), 400)
+        @test isOK(st)
+        @test srv.routed_write_refusals == 1    # went inline first time
+        @test srv.data[401:(400 + length(payload))] == payload
+
+        st, buf = read(f, 64, 0)
+        @test isOK(st) && buf == srv.data[1:64]
+
+        close(f)
+        @test isempty(srv.violations)
+    end
+
     @testset "the control link and the data path interleave" begin
         conf_reset!(srv)
         srv.data = copy(CONF_CONTENT)

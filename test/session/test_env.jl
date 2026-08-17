@@ -202,10 +202,14 @@ using XRootD.Session:
     end
 
     @testset "the mechanism order" begin
+        # env_auth_order tells "nothing imposed" apart from "an order imposed":
+        # nothing means the server's own preference order will stand.
         withenv("XrdSecPROTOCOL" => nothing) do
+            @test Session.env_auth_order() === nothing
             @test auth_order() == collect(DEFAULT_AUTH_ORDER)
         end
         withenv("XrdSecPROTOCOL" => "unix,ztn") do
+            @test Session.env_auth_order() == ["unix", "ztn"]
             @test auth_order() == ["unix", "ztn"]
         end
         # Comma, space, or both — XrdCl accepts all three spellings.
@@ -213,6 +217,7 @@ using XRootD.Session:
             @test auth_order() == ["ztn", "gsi", "sss"]
         end
         withenv("XrdSecPROTOCOL" => "   ") do
+            @test Session.env_auth_order() === nothing
             @test auth_order() == collect(DEFAULT_AUTH_ORDER)
         end
     end

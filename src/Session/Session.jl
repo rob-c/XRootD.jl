@@ -20,7 +20,7 @@ module Session
 using Sockets: Sockets, TCPSocket
 using OpenSSL: OpenSSL
 using OpenSSL_jll: libssl
-using SHA: hmac_sha256
+using SHA: sha256
 using ..Wire
 
 include("blowfish.jl")
